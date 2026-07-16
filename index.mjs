@@ -48,6 +48,13 @@ const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS) || 20 * 60 * 100
 // is a "give it a moment to clean up" cushion, not a tunable knob like the
 // timeout itself.
 const CLAUDE_KILL_GRACE_MS = 5000;
+// Model for research runs. Empty = the CLI's default model. Set
+// RUNNER_MODEL=sonnet to trade research depth for usage headroom.
+const RUNNER_MODEL = process.env.RUNNER_MODEL || '';
+// Jobs processed at once (in-process workers). The conditional claim in the
+// worker loop is atomic — the loser gets 0 rows back — so workers can't
+// double-claim, and boot crash-recovery stays safe: still one runner process.
+const CONCURRENCY = Number(process.env.RUNNER_CONCURRENCY) || 2;
 
 let CLAUDE_BIN;
 try {
@@ -245,6 +252,7 @@ function runClaude(prompt) {
         'WebSearch,WebFetch',
         '--permission-mode',
         'dontAsk',
+        ...(RUNNER_MODEL ? ['--model', RUNNER_MODEL] : []),
         '--json-schema',
         schemaText,
       ],
@@ -290,6 +298,7 @@ function runClaude(prompt) {
   });
 }
 
+async function worker() {
 while (true) {
   const { data: queued, error: queuedError } = await supabase
     .from('enrichment_jobs')
@@ -371,7 +380,15 @@ while (true) {
     const prompt = `/company-preview name="${company.name}" domain="${company.domain}" newsroom_url="${company.newsroom_url ?? ''}"`;
 
     console.log(`invoking claude -p for company ${company.id} (${company.name})`);
-    const result = await runClaude(prompt);
+    let result = await runClaude(prompt);
+    // One retry for transient API failures ("API Error: 529 Overloaded" etc.)
+    // — those die in seconds and cost ~no tokens, unlike a real research run.
+    // ponytail: single retry, fixed delay; a backoff loop is the upgrade path.
+    if (result.code !== 0 && /API Error: 5\d\d|overloaded/i.test(result.stdout + result.stderr)) {
+      console.error(`job ${job.id}: transient API error, retrying once in 60s`);
+      await sleep(60_000);
+      result = await runClaude(prompt);
+    }
 
     // Hard gate: must run to completion, and pass, before any facts/sources/
     // company write is attempted.
@@ -431,6 +448,17 @@ while (true) {
     // process or a wedged queue.
     console.error(`job ${job.id} failed: ${err.message}`);
 
+    // Loud failure: macOS banner so a dead run is never silent. The web UI
+    // shows the same error on the company row; this covers eyes-off-the-app.
+    try {
+      spawn('osascript', [
+        '-e',
+        `display notification "${String(err.message).slice(0, 120).replace(/"/g, "'")}" with title "CRM runner: job failed"`,
+      ]);
+    } catch {
+      // Notification is best-effort — never let it mask the real failure path.
+    }
+
     // Compensation for partial writes: no DELETE policy exists, so facts
     // inserted before a later write failed are marked rejected (hidden in
     // the UI). ponytail: an insert_brief RPC (one transaction) is the
@@ -474,3 +502,6 @@ while (true) {
     }
   }
 }
+}
+
+await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
