@@ -20,20 +20,24 @@ export async function signInRunner() {
   return { runner, userId: data.user.id };
 }
 
-export async function findOrCreateRunnerTestCo(runner, userId) {
+export async function findOrCreateCompany(runner, userId, name, domain) {
   const { data: existing, error } = await runner
     .from('companies')
     .select('id')
-    .eq('domain', COMPANY_DOMAIN)
+    .eq('domain', domain)
     .maybeSingle();
   if (error) throw error;
   if (existing) return existing.id;
 
   const { data: created, error: insertError } = await runner
     .from('companies')
-    .insert({ name: COMPANY_NAME, domain: COMPANY_DOMAIN, created_by: userId })
+    .insert({ name, domain, created_by: userId })
     .select('id')
     .single();
   if (insertError) throw insertError;
   return created.id;
+}
+
+export function findOrCreateRunnerTestCo(runner, userId) {
+  return findOrCreateCompany(runner, userId, COMPANY_NAME, COMPANY_DOMAIN);
 }

@@ -11,13 +11,14 @@ import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { signInRunner, findOrCreateRunnerTestCo } from './helpers.mjs';
+import { signInRunner, findOrCreateRunnerTestCo, findOrCreateCompany } from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER_ROOT = path.join(__dirname, '..');
 const INDEX = path.join(RUNNER_ROOT, 'index.mjs');
 const FIXTURE_SUCCESS = path.join(__dirname, 'fixtures', 'fake-claude-success.mjs');
 const FIXTURE_INVALID = path.join(__dirname, 'fixtures', 'fake-claude-invalid.mjs');
+const FIXTURE_BAD_SCHEMA = path.join(__dirname, 'fixtures', 'fake-claude-bad-schema.mjs');
 
 const POLL_INTERVAL_MS = 1000;
 const POLL_TIMEOUT_MS = 30000;
@@ -168,4 +169,84 @@ test('lifecycle: invalid fixture fails the job with zero writes and restores com
     .eq('company_id', companyId);
   if (postFactCountError) throw postFactCountError;
   assert.equal(postFactCount, preFactCount, 'expected fact count unchanged (exact before/after) on schema-validation failure');
+});
+
+test('lifecycle: a well-formed envelope with a sourceless fact fails the schema gate with zero writes', async (t) => {
+  const { runner, userId } = await signInRunner();
+  const companyId = await findOrCreateRunnerTestCo(runner, userId);
+
+  const { data: preClaim, error: preClaimError } = await runner.from('companies').select('status').eq('id', companyId).single();
+  if (preClaimError) throw preClaimError;
+
+  const { count: preFactCount, error: preFactCountError } = await runner
+    .from('facts')
+    .select('id', { count: 'exact', head: true })
+    .eq('company_id', companyId);
+  if (preFactCountError) throw preFactCountError;
+
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  const child = spawnRunner(FIXTURE_BAD_SCHEMA);
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  const finalJob = await pollUntilTerminal(runner, job.id);
+  assert.equal(finalJob.status, 'failed', `expected job to fail, got '${finalJob.status}'`);
+  // Distinguishes the layer: checkShape passed (valid envelope), the
+  // hand-rolled schema walk is what rejected it.
+  assert.match(finalJob.error ?? '', /schema check/, `expected a schema-check error, got: ${finalJob.error}`);
+
+  const { data: company, error: companyError } = await runner.from('companies').select('status').eq('id', companyId).single();
+  if (companyError) throw companyError;
+  assert.equal(company.status, preClaim.status, 'expected company status restored to its pre-claim value');
+
+  const { count: postFactCount, error: postFactCountError } = await runner
+    .from('facts')
+    .select('id', { count: 'exact', head: true })
+    .eq('company_id', companyId);
+  if (postFactCountError) throw postFactCountError;
+  assert.equal(postFactCount, preFactCount, 'expected zero fact writes when the nested-source gate rejects');
+});
+
+test('lifecycle: a company with a hostile domain fails input validation before any status flip', async (t) => {
+  const { runner, userId } = await signInRunner();
+  // Space in the domain violates validateInputs' bare-domain rule — the same
+  // rule that keeps user-typed company fields from reaching the claude -p
+  // prompt (trust boundary ported from test-run.sh).
+  const companyId = await findOrCreateCompany(runner, userId, 'Runner Evil Co', 'evil domain.example');
+
+  const { data: pre, error: preError } = await runner.from('companies').select('status').eq('id', companyId).single();
+  if (preError) throw preError;
+
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  // Success fixture on purpose: if validation is doing its job, no claude
+  // binary — real or fake — is ever invoked for this company.
+  const child = spawnRunner(FIXTURE_SUCCESS);
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  const finalJob = await pollUntilTerminal(runner, job.id);
+  assert.equal(finalJob.status, 'failed', `expected job to fail, got '${finalJob.status}'`);
+  assert.match(finalJob.error ?? '', /invalid company inputs/, `expected an input-validation error, got: ${finalJob.error}`);
+
+  // Never flipped (as opposed to restored): validation runs before the
+  // in_progress write, so the status must be byte-identical to pre-claim.
+  const { data: company, error: companyError } = await runner.from('companies').select('status').eq('id', companyId).single();
+  if (companyError) throw companyError;
+  assert.equal(company.status, pre.status, 'expected company status untouched by a job that failed input validation');
 });
