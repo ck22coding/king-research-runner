@@ -41,6 +41,13 @@ if (missing.length > 0) {
 const { RUNNER_EMAIL, RUNNER_PASSWORD, NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY } =
   process.env;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 5000;
+// Hard ceiling on a single claude -p run. Env-overridable for tests; default
+// is generous because real research runs take 5-15 minutes (see BUILD.md).
+const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS) || 20 * 60 * 1000;
+// ponytail: fixed grace between SIGTERM and SIGKILL, no env override — this
+// is a "give it a moment to clean up" cushion, not a tunable knob like the
+// timeout itself.
+const CLAUDE_KILL_GRACE_MS = 5000;
 
 let CLAUDE_BIN;
 try {
@@ -115,7 +122,13 @@ function snippet(s, n = 300) {
 // would already have caught for it (spawn error, non-zero exit). Must run to
 // completion — and pass — before any facts/sources/company write is
 // attempted. Returns { ok: true, structured } or { ok: false, error }.
-function checkShape({ stdout, stderr, code, spawnError }) {
+function checkShape({ stdout, stderr, code, spawnError, timedOut }) {
+  if (timedOut) {
+    return {
+      ok: false,
+      error: `claude -p hit its ${CLAUDE_TIMEOUT_MS}ms timeout and was killed. stderr: ${snippet(stderr)} stdout: ${snippet(stdout)}`,
+    };
+  }
   if (spawnError) {
     return { ok: false, error: `claude process failed to spawn: ${spawnError.message}` };
   }
@@ -184,7 +197,10 @@ if (recoverError) {
 // Runs claude -p exactly per test-run.sh's contract: args array (no shell),
 // launched with cwd = the plugin directory so skill discovery works. Never
 // rejects — resolves with everything checkShape() needs (stdout, stderr,
-// exit code, spawn error) so failure classification happens in one place.
+// exit code, spawn error, timedOut) so failure classification happens in one
+// place. Hard-times-out at CLAUDE_TIMEOUT_MS: SIGTERM first, then SIGKILL if
+// the child hasn't exited after CLAUDE_KILL_GRACE_MS — a run that hangs
+// (network stall, runaway agent loop, etc.) must never wedge the queue.
 function runClaude(prompt) {
   return new Promise((resolve) => {
     const child = spawn(
@@ -208,15 +224,28 @@ function runClaude(prompt) {
     let stdout = '';
     let stderr = '';
     let settled = false;
+    let timedOut = false;
+    let killTimer;
+
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => {
+        if (!settled) child.kill('SIGKILL');
+      }, CLAUDE_KILL_GRACE_MS);
+    }, CLAUDE_TIMEOUT_MS);
+
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(killTimer);
       resolve(result);
     };
     child.stdout.on('data', (d) => (stdout += d));
     child.stderr.on('data', (d) => (stderr += d));
-    child.on('error', (spawnError) => finish({ stdout, stderr, code: null, spawnError }));
-    child.on('close', (code) => finish({ stdout, stderr, code, spawnError: null }));
+    child.on('error', (spawnError) => finish({ stdout, stderr, code: null, spawnError, timedOut }));
+    child.on('close', (code) => finish({ stdout, stderr, code, spawnError: null, timedOut }));
   });
 }
 
