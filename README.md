@@ -71,3 +71,17 @@ The runner's own database access is likewise scoped down: it signs in as an
 ordinary authenticated user (email + password from `.env`) whose write
 access comes entirely from that account's `can_enrich=true` flag. No
 service-role key is used anywhere.
+
+## Operational notes (tests vs. a live runner)
+
+The daemon and the test suites must not run at the same time — both learned
+the hard way on 2026-07-16:
+
+- **Stop the daemon before running any test suite** (this repo's, or
+  `web/`'s Playwright E2E). Tests insert `queued` jobs and expect them to
+  stay queued; a live daemon claims them and launches a real, paid
+  `claude -p` research run on a test/fixture company.
+- **Don't run this repo's tests while real jobs are queued.** The lifecycle
+  tests spawn real runner processes (with a fake `claude`), and a runner
+  claims the *oldest* queued job — which could be a real company's. With no
+  real jobs queued, the fixture jobs are all it can grab.
