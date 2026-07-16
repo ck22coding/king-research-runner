@@ -97,6 +97,32 @@ test('lifecycle: success fixture takes a queued job to done with suggested facts
   assert.equal(company.status, 'ready');
 });
 
+test('lifecycle: a job stuck running at boot is not wedged (crash recovery)', async (t) => {
+  const { runner, userId } = await signInRunner();
+  const companyId = await findOrCreateRunnerTestCo(runner, userId);
+
+  // Simulate a crashed prior run: a job left in 'running' before this
+  // runner process ever starts. Boot-time recovery must reset it to
+  // 'queued' so the main loop picks it up like any other job — if
+  // recovery is missing, this job stays 'running' forever and the
+  // poll below times out.
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ company_id: companyId, status: 'running', requested_by: userId, started_at: new Date().toISOString() })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  const child = spawnRunner(FIXTURE_SUCCESS);
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  const finalJob = await pollUntilTerminal(runner, job.id);
+  assert.equal(finalJob.status, 'done', `expected crash-recovered job to finish done, got '${finalJob.status}' (error=${finalJob.error})`);
+});
+
 test('lifecycle: invalid fixture fails the job with zero writes and restores company status', async (t) => {
   const { runner, userId } = await signInRunner();
   const companyId = await findOrCreateRunnerTestCo(runner, userId);
