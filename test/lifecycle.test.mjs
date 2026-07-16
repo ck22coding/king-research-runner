@@ -19,6 +19,7 @@ const INDEX = path.join(RUNNER_ROOT, 'index.mjs');
 const FIXTURE_SUCCESS = path.join(__dirname, 'fixtures', 'fake-claude-success.mjs');
 const FIXTURE_INVALID = path.join(__dirname, 'fixtures', 'fake-claude-invalid.mjs');
 const FIXTURE_BAD_SCHEMA = path.join(__dirname, 'fixtures', 'fake-claude-bad-schema.mjs');
+const FIXTURE_REPEAT = path.join(__dirname, 'fixtures', 'fake-claude-repeat.mjs');
 
 const POLL_INTERVAL_MS = 1000;
 const POLL_TIMEOUT_MS = 30000;
@@ -96,6 +97,53 @@ test('lifecycle: success fixture takes a queued job to done with suggested facts
   const { data: company, error: companyError } = await runner.from('companies').select('status').eq('id', companyId).single();
   if (companyError) throw companyError;
   assert.equal(company.status, 'ready');
+});
+
+test('lifecycle: a repeat suggestion (same source URL) is suppressed, job still done', async (t) => {
+  const { runner, userId } = await signInRunner();
+  const companyId = await findOrCreateRunnerTestCo(runner, userId);
+
+  // The repeat fixture cites the SAME url every run. History may already
+  // contain it from prior suite runs (rejected facts persist as dedup log),
+  // so assert on the delta: after job 1 lands, job 2 must add zero rows.
+  const REPEAT_URL = 'https://runner-test.example/news/repeat-fixture';
+  const countRepeatSources = async () => {
+    const { count, error } = await runner
+      .from('sources')
+      .select('id, facts!inner(company_id)', { count: 'exact', head: true })
+      .eq('facts.company_id', companyId)
+      .eq('url', REPEAT_URL);
+    if (error) throw error;
+    return count;
+  };
+
+  const child = spawnRunner(FIXTURE_REPEAT);
+  let lastJobId;
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, lastJobId);
+  });
+
+  const insertJob = async () => {
+    const { data: job, error } = await runner
+      .from('enrichment_jobs')
+      .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+      .select('id')
+      .single();
+    if (error) throw error;
+    lastJobId = job.id;
+    return job.id;
+  };
+
+  const job1 = await pollUntilTerminal(runner, await insertJob());
+  assert.equal(job1.status, 'done', `expected first repeat-fixture job done, got '${job1.status}' (error=${job1.error})`);
+  const afterFirst = await countRepeatSources();
+  assert.ok(afterFirst >= 1, 'expected the repeat URL to be on file after the first run');
+
+  const job2 = await pollUntilTerminal(runner, await insertJob());
+  assert.equal(job2.status, 'done', `expected second repeat-fixture job done, got '${job2.status}' (error=${job2.error})`);
+  const afterSecond = await countRepeatSources();
+  assert.equal(afterSecond, afterFirst, 'expected zero new source rows for an already-suggested URL');
 });
 
 test('lifecycle: a job stuck running at boot is not wedged (crash recovery)', async (t) => {

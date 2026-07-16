@@ -123,6 +123,21 @@ function snippet(s, n = 300) {
   return str.length > n ? `${str.slice(0, n)}…` : str;
 }
 
+// Dedup key for suggested-source URLs: lowercase host minus www., path minus
+// trailing slashes; protocol/query/fragment dropped (tracking params, http vs
+// https). Known gap: a story resurfacing under a genuinely different URL is
+// NOT caught — needs group_key/text-similarity matching, out of scope for v1.
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    const pathname = u.pathname.replace(/\/+$/, '') || '/';
+    return `${host}${pathname}`;
+  } catch {
+    return String(url).trim().toLowerCase();
+  }
+}
+
 // The hard gate: replicates test-run.sh's loud-failure shape check
 // (`jq -e '(type == "array") and ((.[-1].structured_output? | type) == "object")'`)
 // plus the process-level failure modes test-run.sh's `set -euo pipefail`
@@ -377,7 +392,35 @@ while (true) {
       .eq('id', company.id);
     if (inProgressError) throw inProgressError;
 
-    const prompt = `/company-preview name="${company.name}" domain="${company.domain}" newsroom_url="${company.newsroom_url ?? ''}"`;
+    // No repeat suggestions: the sources table IS the log, tagged via its
+    // fact's status. Pull every URL ever suggested for this company, any
+    // status — approved, rejected, and still-pending all count.
+    const { data: existingSources, error: existingSourcesError } = await supabase
+      .from('sources')
+      .select('url, facts!inner(created_at)')
+      .eq('facts.company_id', company.id)
+      .order('facts(created_at)', { ascending: false });
+    if (existingSourcesError) throw existingSourcesError;
+
+    const knownNormalized = new Set(); // authoritative, unbounded — the insert filter uses this
+    const knownUrls = []; // capped hint for the prompt, most-recent first
+    // ponytail: caps the PROMPT hint only; knownNormalized is never capped,
+    // so correctness never depends on this. Raise if a company passes 150+
+    // distinct prior sources and repeats still slip past the model.
+    const EXCLUDE_URL_CAP = 150;
+    for (const s of existingSources ?? []) {
+      const norm = normalizeUrl(s.url);
+      if (knownNormalized.has(norm)) continue;
+      knownNormalized.add(norm);
+      // Same trust-boundary concern as validateInputs(): a stray `"` or
+      // newline in a stored URL must not break the known_urls="..." arg.
+      if (knownUrls.length < EXCLUDE_URL_CAP && !s.url.includes('"') && !s.url.includes('\n')) {
+        knownUrls.push(s.url);
+      }
+    }
+    const knownUrlsArg = knownUrls.length > 0 ? ` known_urls="${knownUrls.join(',')}"` : '';
+
+    const prompt = `/company-preview name="${company.name}" domain="${company.domain}" newsroom_url="${company.newsroom_url ?? ''}"${knownUrlsArg}`;
 
     console.log(`invoking claude -p for company ${company.id} (${company.name})`);
     let result = await runClaude(prompt);
@@ -399,7 +442,19 @@ while (true) {
 
     const structured = shape.structured;
 
-    const factRows = structured.facts.map((f) => ({
+    // Drop repeat suggestions: if ANY cited source URL (normalized) is
+    // already known, drop the WHOLE fact — every source must be the specific
+    // supporting article (SKILL.md sourcing rules), so a match means the same
+    // underlying story. The earlier fact's status doesn't matter.
+    const newFacts = structured.facts.filter(
+      (f) => !f.sources.some((s) => knownNormalized.has(normalizeUrl(s.url)))
+    );
+    const skipped = structured.facts.length - newFacts.length;
+    if (skipped > 0) {
+      console.log(`job ${job.id}: skipped ${skipped} repeat fact(s) for company ${company.id}`);
+    }
+
+    const factRows = newFacts.map((f) => ({
       company_id: company.id,
       section: f.section,
       text: f.text,
@@ -411,7 +466,7 @@ while (true) {
     if (factsError) throw factsError;
     insertedFactIds = insertedFacts.map((f) => f.id);
 
-    const sourceRows = structured.facts.flatMap((f, i) =>
+    const sourceRows = newFacts.flatMap((f, i) =>
       f.sources.map((s) => ({
         fact_id: insertedFacts[i].id,
         publisher: s.publisher,

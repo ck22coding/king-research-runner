@@ -17,7 +17,12 @@ const structuredOutput = {
         {
           publisher: 'Test Wire',
           title: 'Runner Test Co fixture announcement',
-          url: 'https://runner-test.example/news/fixture',
+          // Unique per invocation: test cleanup rejects facts but can't delete
+          // them (no DELETE policy), and rejected sources count as dedup
+          // history — a fixed URL here would get suppressed on every suite
+          // run after the first. Fixed-URL repeat behavior is covered by
+          // fake-claude-repeat.mjs instead.
+          url: `https://runner-test.example/news/fixture-${process.pid}-${Date.now()}`,
           year: 2026,
         },
       ],
