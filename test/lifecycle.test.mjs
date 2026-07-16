@@ -131,6 +131,16 @@ test('lifecycle: invalid fixture fails the job with zero writes and restores com
   if (preClaimError) throw preClaimError;
   const preClaimStatus = preClaim.status;
 
+  // Exact count (not just "suggested" rows) taken before the job runs, so the
+  // post-run comparison proves zero facts were written of ANY status — Runner
+  // Test Co is exclusively used by these tests, so an exact before/after
+  // count is a safe, precise check (not just "some facts exist").
+  const { count: preFactCount, error: preFactCountError } = await runner
+    .from('facts')
+    .select('id', { count: 'exact', head: true })
+    .eq('company_id', companyId);
+  if (preFactCountError) throw preFactCountError;
+
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
     .insert({ company_id: companyId, status: 'queued', requested_by: userId })
@@ -148,11 +158,14 @@ test('lifecycle: invalid fixture fails the job with zero writes and restores com
   assert.equal(finalJob.status, 'failed', `expected job to fail, got '${finalJob.status}'`);
   assert.ok(finalJob.error && finalJob.error.length > 0, 'expected job.error to record the failure reason');
 
-  const { data: facts, error: factsError } = await runner.from('facts').select('id').eq('company_id', companyId).eq('status', 'suggested');
-  if (factsError) throw factsError;
-  assert.equal(facts.length, 0, 'expected zero facts written on schema-validation failure');
-
   const { data: company, error: companyError } = await runner.from('companies').select('status').eq('id', companyId).single();
   if (companyError) throw companyError;
-  assert.equal(company.status, preClaimStatus, "expected company status restored to its pre-claim value");
+  assert.equal(company.status, preClaimStatus, 'expected company status restored to its pre-claim value');
+
+  const { count: postFactCount, error: postFactCountError } = await runner
+    .from('facts')
+    .select('id', { count: 'exact', head: true })
+    .eq('company_id', companyId);
+  if (postFactCountError) throw postFactCountError;
+  assert.equal(postFactCount, preFactCount, 'expected fact count unchanged (exact before/after) on schema-validation failure');
 });

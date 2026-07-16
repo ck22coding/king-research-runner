@@ -69,11 +69,101 @@ if (signInError) {
 console.log(`runner started: signed in as ${RUNNER_EMAIL}, claude binary resolved to ${CLAUDE_BIN}`);
 
 let schemaText;
+let schema;
 try {
   schemaText = readFileSync(SCHEMA_PATH, 'utf8');
+  schema = JSON.parse(schemaText);
 } catch (err) {
-  console.error(`FATAL: could not read output schema at ${SCHEMA_PATH} (${err.message})`);
+  console.error(`FATAL: could not read/parse output schema at ${SCHEMA_PATH} (${err.message})`);
   process.exit(1);
+}
+
+// Second (lightweight) validation check reads its required-field lists and
+// section enum straight off the schema itself rather than hardcoding a
+// second copy — same "hand-rolled, schema-specific check, not a general
+// JSON-Schema validator" philosophy test-run.sh's grade() function uses.
+const TOP_LEVEL_REQUIRED = schema.required;
+const FACT_REQUIRED = schema.properties.facts.items.required;
+const SECTION_ENUM = schema.properties.facts.items.properties.section.enum;
+
+// Ported verbatim from test-run.sh's main() three input checks (see that
+// script) — trust-boundary validation on company data that came from the DB
+// but originated as free-text user input, before any of it is interpolated
+// into the claude -p prompt. Returns an error string, or null if valid.
+function validateInputs(name, domain, newsroomUrl) {
+  if (name.includes('"') || name.includes('\n')) {
+    return 'company name must not contain double quotes or newlines';
+  }
+  if (!/^[A-Za-z0-9.-]+$/.test(domain)) {
+    return 'domain must be a bare domain (letters/digits/dots/dashes only)';
+  }
+  if (newsroomUrl != null && !/^https?:\/\/[^"\s]+$/.test(newsroomUrl)) {
+    return 'newsroom_url must be an http(s) URL with no quotes or whitespace';
+  }
+  return null;
+}
+
+function snippet(s, n = 300) {
+  if (!s) return '(empty)';
+  const str = String(s);
+  return str.length > n ? `${str.slice(0, n)}…` : str;
+}
+
+// The hard gate: replicates test-run.sh's loud-failure shape check
+// (`jq -e '(type == "array") and ((.[-1].structured_output? | type) == "object")'`)
+// plus the process-level failure modes test-run.sh's `set -euo pipefail`
+// would already have caught for it (spawn error, non-zero exit). Must run to
+// completion — and pass — before any facts/sources/company write is
+// attempted. Returns { ok: true, structured } or { ok: false, error }.
+function checkShape({ stdout, stderr, code, spawnError }) {
+  if (spawnError) {
+    return { ok: false, error: `claude process failed to spawn: ${spawnError.message}` };
+  }
+  if (code !== 0) {
+    return {
+      ok: false,
+      error: `claude exited with code ${code}. stderr: ${snippet(stderr)} stdout: ${snippet(stdout)}`,
+    };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (err) {
+    return { ok: false, error: `claude stdout did not parse as JSON (${err.message}). stdout: ${snippet(stdout)}` };
+  }
+  if (!Array.isArray(parsed)) {
+    return { ok: false, error: `claude stdout did not parse as a JSON array. stdout: ${snippet(stdout)}` };
+  }
+  const structured = parsed.at(-1)?.structured_output;
+  if (structured === null || typeof structured !== 'object' || Array.isArray(structured)) {
+    return {
+      ok: false,
+      error: `claude output has no structured_output object at .at(-1).structured_output. stdout: ${snippet(stdout)}`,
+    };
+  }
+  return { ok: true, structured };
+}
+
+// Lightweight second check: hand-rolled loop over output-schema.json's own
+// required arrays + section enum (see TOP_LEVEL_REQUIRED/FACT_REQUIRED/
+// SECTION_ENUM above). Returns an error string, or null if valid.
+function checkAgainstSchema(structured) {
+  for (const key of TOP_LEVEL_REQUIRED) {
+    if (!(key in structured)) return `structured_output missing required key: ${key}`;
+  }
+  if (!Array.isArray(structured.facts)) return 'structured_output.facts is not an array';
+  for (const [i, fact] of structured.facts.entries()) {
+    if (fact === null || typeof fact !== 'object' || Array.isArray(fact)) {
+      return `facts[${i}] is not an object`;
+    }
+    for (const key of FACT_REQUIRED) {
+      if (!(key in fact)) return `facts[${i}] missing required key: ${key}`;
+    }
+    if (!SECTION_ENUM.includes(fact.section)) {
+      return `facts[${i}].section '${fact.section}' is not one of the 8-value enum`;
+    }
+  }
+  return null;
 }
 
 // ponytail: single-runner ceiling. A job found 'running' at boot can only be
@@ -92,9 +182,11 @@ if (recoverError) {
 }
 
 // Runs claude -p exactly per test-run.sh's contract: args array (no shell),
-// launched with cwd = the plugin directory so skill discovery works.
+// launched with cwd = the plugin directory so skill discovery works. Never
+// rejects — resolves with everything checkShape() needs (stdout, stderr,
+// exit code, spawn error) so failure classification happens in one place.
 function runClaude(prompt) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const child = spawn(
       CLAUDE_BIN,
       [
@@ -114,9 +206,17 @@ function runClaude(prompt) {
       { cwd: PLUGIN_DIR }
     );
     let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     child.stdout.on('data', (d) => (stdout += d));
-    child.on('error', reject);
-    child.on('close', () => resolve(stdout));
+    child.stderr.on('data', (d) => (stderr += d));
+    child.on('error', (spawnError) => finish({ stdout, stderr, code: null, spawnError }));
+    child.on('close', (code) => finish({ stdout, stderr, code, spawnError: null }));
   });
 }
 
@@ -150,67 +250,105 @@ while (true) {
 
   console.log(`claimed job ${job.id} (company ${job.company_id})`);
 
-  const { data: company, error: companyError } = await supabase
-    .from('companies')
-    .select('*')
-    .eq('id', job.company_id)
-    .single();
-  if (companyError) throw companyError;
+  // Tracks the company's status as it was found before this job touched it,
+  // so the catch block below knows what to restore it to. Stays undefined
+  // until the company row is actually fetched — if that fetch itself fails,
+  // nothing was ever flipped, so there is nothing to restore.
+  let previousStatus;
 
-  const previousStatus = company.status;
-  await supabase.from('companies').update({ status: 'in_progress' }).eq('id', company.id);
+  try {
+    const { data: company, error: companyError } = await supabase
+      .from('companies')
+      .select('*')
+      .eq('id', job.company_id)
+      .single();
+    if (companyError) throw companyError;
 
-  // Prompt-input safety (quote/newline/domain validation) lands in Task 5 —
-  // for now these inputs are trusted (Runner Test Co + the seeded companies).
-  const prompt = `/company-preview name="${company.name}" domain="${company.domain}" newsroom_url="${company.newsroom_url ?? ''}"`;
+    previousStatus = company.status;
 
-  console.log(`invoking claude -p for company ${company.id} (${company.name})`);
-  const stdout = await runClaude(prompt);
+    // Trust-boundary check on DB-sourced, user-typed company fields, run
+    // BEFORE any status flip — invalid input means the company row is never
+    // touched (nothing flipped, nothing to restore), only the job fails.
+    const inputError = validateInputs(company.name, company.domain, company.newsroom_url);
+    if (inputError) {
+      const { error: jobFailError } = await supabase
+        .from('enrichment_jobs')
+        .update({ status: 'failed', error: `invalid company inputs: ${inputError}`, finished_at: new Date().toISOString() })
+        .eq('id', job.id);
+      if (jobFailError) throw jobFailError;
+      console.error(`job ${job.id} failed input validation: ${inputError}`);
+      continue;
+    }
 
-  // Happy path only — the loud-failure shape check (missing structured_output,
-  // non-JSON stdout, etc.) is Task 5.
-  const structured = JSON.parse(stdout).at(-1).structured_output;
+    await supabase.from('companies').update({ status: 'in_progress' }).eq('id', company.id);
 
-  const factRows = structured.facts.map((f) => ({
-    company_id: company.id,
-    section: f.section,
-    text: f.text,
-    fact_date: f.fact_date,
-    group_key: f.group_key,
-    // status defaults to 'suggested' — not set here.
-  }));
-  const { data: insertedFacts, error: factsError } = await supabase.from('facts').insert(factRows).select('id');
-  if (factsError) throw factsError;
+    const prompt = `/company-preview name="${company.name}" domain="${company.domain}" newsroom_url="${company.newsroom_url ?? ''}"`;
 
-  const sourceRows = structured.facts.flatMap((f, i) =>
-    f.sources.map((s) => ({
-      fact_id: insertedFacts[i].id,
-      publisher: s.publisher,
-      title: s.title,
-      url: s.url,
-      year: s.year,
-    }))
-  );
-  if (sourceRows.length > 0) {
-    const { error: sourcesError } = await supabase.from('sources').insert(sourceRows);
-    if (sourcesError) throw sourcesError;
+    console.log(`invoking claude -p for company ${company.id} (${company.name})`);
+    const result = await runClaude(prompt);
+
+    // Hard gate: must run to completion, and pass, before any facts/sources/
+    // company write is attempted.
+    const shape = checkShape(result);
+    if (!shape.ok) throw new Error(shape.error);
+    const schemaError = checkAgainstSchema(shape.structured);
+    if (schemaError) throw new Error(`structured_output failed schema check: ${schemaError}`);
+
+    const structured = shape.structured;
+
+    const factRows = structured.facts.map((f) => ({
+      company_id: company.id,
+      section: f.section,
+      text: f.text,
+      fact_date: f.fact_date,
+      group_key: f.group_key,
+      // status defaults to 'suggested' — not set here.
+    }));
+    const { data: insertedFacts, error: factsError } = await supabase.from('facts').insert(factRows).select('id');
+    if (factsError) throw factsError;
+
+    const sourceRows = structured.facts.flatMap((f, i) =>
+      f.sources.map((s) => ({
+        fact_id: insertedFacts[i].id,
+        publisher: s.publisher,
+        title: s.title,
+        url: s.url,
+        year: s.year,
+      }))
+    );
+    if (sourceRows.length > 0) {
+      const { error: sourcesError } = await supabase.from('sources').insert(sourceRows);
+      if (sourcesError) throw sourcesError;
+    }
+
+    const { error: companyDoneError } = await supabase
+      .from('companies')
+      .update({
+        tldr: structured.tldr,
+        newsroom_url: company.newsroom_url ?? structured.newsroom_url,
+        status: 'ready',
+      })
+      .eq('id', company.id);
+    if (companyDoneError) throw companyDoneError;
+
+    const { error: jobDoneError } = await supabase
+      .from('enrichment_jobs')
+      .update({ status: 'done', finished_at: new Date().toISOString() })
+      .eq('id', job.id);
+    if (jobDoneError) throw jobDoneError;
+
+    console.log(`done: job ${job.id} (company ${company.id}), previous company status was '${previousStatus}'`);
+  } catch (err) {
+    // Any thrown error (network, DB write failure mid-run, shape/schema
+    // gate, etc.) lands here: job failed + company restored, never a crashed
+    // process or a wedged queue.
+    console.error(`job ${job.id} failed: ${err.message}`);
+    await supabase
+      .from('enrichment_jobs')
+      .update({ status: 'failed', error: err.message, finished_at: new Date().toISOString() })
+      .eq('id', job.id);
+    if (previousStatus !== undefined) {
+      await supabase.from('companies').update({ status: previousStatus }).eq('id', job.company_id);
+    }
   }
-
-  const { error: companyDoneError } = await supabase
-    .from('companies')
-    .update({
-      tldr: structured.tldr,
-      newsroom_url: company.newsroom_url ?? structured.newsroom_url,
-      status: 'ready',
-    })
-    .eq('id', company.id);
-  if (companyDoneError) throw companyDoneError;
-
-  const { error: jobDoneError } = await supabase
-    .from('enrichment_jobs')
-    .update({ status: 'done', finished_at: new Date().toISOString() })
-    .eq('id', job.id);
-  if (jobDoneError) throw jobDoneError;
-
-  console.log(`done: job ${job.id} (company ${company.id}), previous company status was '${previousStatus}'`);
 }
