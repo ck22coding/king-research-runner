@@ -122,7 +122,13 @@ function snippet(s, n = 300) {
 // would already have caught for it (spawn error, non-zero exit). Must run to
 // completion — and pass — before any facts/sources/company write is
 // attempted. Returns { ok: true, structured } or { ok: false, error }.
-function checkShape({ stdout, stderr, code, spawnError, timedOut }) {
+function checkShape({ stdout, stderr, code, spawnError, timedOut, overflowed }) {
+  if (overflowed) {
+    return {
+      ok: false,
+      error: `claude output exceeded the 10MB cap and the process was killed. stderr: ${snippet(stderr)}`,
+    };
+  }
   if (timedOut) {
     return {
       ok: false,
@@ -175,6 +181,29 @@ function checkAgainstSchema(structured) {
     if (!SECTION_ENUM.includes(fact.section)) {
       return `facts[${i}].section '${fact.section}' is not one of the 8-value enum`;
     }
+    // Nested sources must be fully valid BEFORE any DB write — facts insert
+    // first, so a malformed source discovered mid-write would strand
+    // already-inserted facts (codex review).
+    if (!Array.isArray(fact.sources) || fact.sources.length < 1) {
+      return `facts[${i}].sources is not a non-empty array`;
+    }
+    for (const [j, s] of fact.sources.entries()) {
+      if (s === null || typeof s !== 'object' || Array.isArray(s)) {
+        return `facts[${i}].sources[${j}] is not an object`;
+      }
+      if (typeof s.publisher !== 'string' || s.publisher.length === 0) {
+        return `facts[${i}].sources[${j}].publisher is not a non-empty string`;
+      }
+      if (typeof s.url !== 'string' || !/^https?:\/\//.test(s.url)) {
+        return `facts[${i}].sources[${j}].url is not an http(s) URL`;
+      }
+      if (s.year !== null && !Number.isInteger(s.year)) {
+        return `facts[${i}].sources[${j}].year is not an integer or null`;
+      }
+      if (s.title !== null && typeof s.title !== 'string') {
+        return `facts[${i}].sources[${j}].title is not a string or null`;
+      }
+    }
   }
   return null;
 }
@@ -225,7 +254,11 @@ function runClaude(prompt) {
     let stderr = '';
     let settled = false;
     let timedOut = false;
+    let overflowed = false;
     let killTimer;
+    // ponytail: 10MB cap — a healthy run's JSON is ~250KB; a runaway child
+    // must not OOM the runner (codex review).
+    const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
     const timeoutTimer = setTimeout(() => {
       timedOut = true;
@@ -242,10 +275,18 @@ function runClaude(prompt) {
       clearTimeout(killTimer);
       resolve(result);
     };
-    child.stdout.on('data', (d) => (stdout += d));
-    child.stderr.on('data', (d) => (stderr += d));
-    child.on('error', (spawnError) => finish({ stdout, stderr, code: null, spawnError, timedOut }));
-    child.on('close', (code) => finish({ stdout, stderr, code, spawnError: null, timedOut }));
+    const capped = (d) => {
+      if (stdout.length + stderr.length + d.length > MAX_OUTPUT_BYTES) {
+        overflowed = true;
+        child.kill('SIGKILL');
+        return false;
+      }
+      return true;
+    };
+    child.stdout.on('data', (d) => capped(d) && (stdout += d));
+    child.stderr.on('data', (d) => capped(d) && (stderr += d));
+    child.on('error', (spawnError) => finish({ stdout, stderr, code: null, spawnError, timedOut, overflowed }));
+    child.on('close', (code) => finish({ stdout, stderr, code, spawnError: null, timedOut, overflowed }));
   });
 }
 
@@ -256,7 +297,13 @@ while (true) {
     .eq('status', 'queued')
     .order('created_at')
     .limit(1);
-  if (queuedError) throw queuedError;
+  // Transient DB errors while polling must not crash the runner — log,
+  // sleep, retry (codex review).
+  if (queuedError) {
+    console.error(`poll error (will retry): ${queuedError.message}`);
+    await sleep(POLL_INTERVAL_MS);
+    continue;
+  }
 
   const job = queued?.[0];
   if (!job) {
@@ -270,7 +317,11 @@ while (true) {
     .eq('id', job.id)
     .eq('status', 'queued')
     .select();
-  if (claimError) throw claimError;
+  if (claimError) {
+    console.error(`claim error (will retry): ${claimError.message}`);
+    await sleep(POLL_INTERVAL_MS);
+    continue;
+  }
   if (!claimed || claimed.length === 0) {
     // Lost a race to claim this job — defensive only, a single runner
     // shouldn't ever hit this.
@@ -284,6 +335,8 @@ while (true) {
   // until the company row is actually fetched — if that fetch itself fails,
   // nothing was ever flipped, so there is nothing to restore.
   let previousStatus;
+  // Fact ids inserted by this job, for compensation if a later write fails.
+  let insertedFactIds = [];
 
   try {
     const { data: company, error: companyError } = await supabase
@@ -309,7 +362,11 @@ while (true) {
       continue;
     }
 
-    await supabase.from('companies').update({ status: 'in_progress' }).eq('id', company.id);
+    const { error: inProgressError } = await supabase
+      .from('companies')
+      .update({ status: 'in_progress' })
+      .eq('id', company.id);
+    if (inProgressError) throw inProgressError;
 
     const prompt = `/company-preview name="${company.name}" domain="${company.domain}" newsroom_url="${company.newsroom_url ?? ''}"`;
 
@@ -335,6 +392,7 @@ while (true) {
     }));
     const { data: insertedFacts, error: factsError } = await supabase.from('facts').insert(factRows).select('id');
     if (factsError) throw factsError;
+    insertedFactIds = insertedFacts.map((f) => f.id);
 
     const sourceRows = structured.facts.flatMap((f, i) =>
       f.sources.map((s) => ({
@@ -372,12 +430,47 @@ while (true) {
     // gate, etc.) lands here: job failed + company restored, never a crashed
     // process or a wedged queue.
     console.error(`job ${job.id} failed: ${err.message}`);
-    await supabase
+
+    // Compensation for partial writes: no DELETE policy exists, so facts
+    // inserted before a later write failed are marked rejected (hidden in
+    // the UI). ponytail: an insert_brief RPC (one transaction) is the
+    // upgrade path if orphaned-rejected rows ever matter (codex review).
+    if (insertedFactIds.length > 0) {
+      const { error: compError } = await supabase
+        .from('facts')
+        .update({ status: 'rejected' })
+        .in('id', insertedFactIds);
+      if (compError) {
+        console.error(
+          `compensation failed — ${insertedFactIds.length} suggested fact(s) from failed job ${job.id} left behind: ${compError.message}`
+        );
+      }
+    }
+
+    // The failure-path writes themselves must be checked: supabase-js
+    // returns {error}, it doesn't throw. If we can't record the failure,
+    // exit — boot crash-recovery resets running→queued on the next start,
+    // which is the one reliable unwedge (codex review).
+    // Order matters: restore the company FIRST, job status LAST — the job's
+    // terminal status is the commit signal observers (UI, tests) key off,
+    // so all other state must be consistent before it flips (mirrors the
+    // success path, where the company update precedes job 'done').
+    let restoreError = null;
+    if (previousStatus !== undefined) {
+      ({ error: restoreError } = await supabase
+        .from('companies')
+        .update({ status: previousStatus })
+        .eq('id', job.company_id));
+    }
+    const { error: failWriteError } = await supabase
       .from('enrichment_jobs')
       .update({ status: 'failed', error: err.message, finished_at: new Date().toISOString() })
       .eq('id', job.id);
-    if (previousStatus !== undefined) {
-      await supabase.from('companies').update({ status: previousStatus }).eq('id', job.company_id);
+    if (failWriteError || restoreError) {
+      console.error(
+        `FATAL: failure-path write failed (job: ${failWriteError?.message ?? 'ok'}, company: ${restoreError?.message ?? 'ok'}) — exiting so boot crash-recovery resets state on restart`
+      );
+      process.exit(1);
     }
   }
 }
