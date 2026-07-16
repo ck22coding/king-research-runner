@@ -1,0 +1,11 @@
+{
+  "name": "runner",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.6"
+  }
+}
