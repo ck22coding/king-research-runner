@@ -54,7 +54,9 @@ const RUNNER_MODEL = process.env.RUNNER_MODEL || '';
 // Jobs processed at once (in-process workers). The conditional claim in the
 // worker loop is atomic — the loser gets 0 rows back — so workers can't
 // double-claim, and boot crash-recovery stays safe: still one runner process.
-const CONCURRENCY = Number(process.env.RUNNER_CONCURRENCY) || 2;
+// Clamped to [1, 8]: negative/NaN/fractional env values fall back sanely and
+// a fat-fingered large value can't stampede the DB or the claude CLI.
+const CONCURRENCY = Math.min(8, Math.max(1, Math.trunc(Number(process.env.RUNNER_CONCURRENCY)) || 2));
 
 let CLAUDE_BIN;
 try {
@@ -328,8 +330,15 @@ function runClaude(prompt) {
 // process (see the boot-recovery comment above).
 const activeCompanies = new Set();
 
+// Flipped when any worker's failure path can't even record a failure. All
+// workers then finish their CURRENT job (protecting in-flight writes) and
+// stop picking up new ones, so Promise.all below resolves and the process
+// actually exits (code 1) — a live-but-wedged runner would never trigger
+// boot crash-recovery for the stuck job.
+let shuttingDown = false;
+
 async function worker() {
-  while (true) {
+  while (!shuttingDown) {
     // ponytail: 10-row scan window — enough to skip past a locked company's
     // queued jobs at this scale; if all 10 are on locked companies we just
     // wait one poll interval.
@@ -356,8 +365,12 @@ async function worker() {
 
     try {
       // 'halt' means this worker's failure path could not even record a
-      // failure — stop this worker (not the process; siblings keep running).
-      if ((await runJob(job)) === 'halt') return;
+      // failure — begin shutdown: siblings drain their current job, then
+      // the process exits so the next start's crash-recovery unwedges state.
+      if ((await runJob(job)) === 'halt') {
+        shuttingDown = true;
+        return;
+      }
     } finally {
       activeCompanies.delete(job.company_id);
     }
