@@ -540,20 +540,16 @@ async function runJob(job) {
 
     // Loud failure: macOS banner so a dead run is never silent. The web UI
     // shows the same error on the company row; this covers eyes-off-the-app.
-    try {
-      const banner = spawn('osascript', [
-        '-e',
-        // Backslashes are escape intros inside AppleScript string literals
-        // (and routine in error text that embeds JSON snippets) — swap them
-        // out along with quotes or the banner itself dies silently.
-        `display notification "${String(err.message).slice(0, 120).replace(/[\\"]/g, "'")}" with title "CRM runner: job failed"`,
-      ]);
-      // spawn failures surface as an async 'error' event; unhandled, that
-      // crashes the whole process from inside the notification path.
-      banner.on('error', () => {});
-    } catch {
-      // Notification is best-effort — never let it mask the real failure path.
-    }
+    const banner = spawn('osascript', [
+      '-e',
+      // Backslashes are escape intros inside AppleScript string literals
+      // (and routine in error text that embeds JSON snippets) — swap them
+      // out along with quotes or the banner itself dies silently.
+      `display notification "${String(err.message).slice(0, 120).replace(/[\\"]/g, "'")}" with title "CRM runner: job failed"`,
+    ]);
+    // Best-effort: spawn failures surface as an async 'error' event;
+    // unhandled, that crashes the whole process from the notification path.
+    banner.on('error', () => {});
 
     // Compensation for partial writes: no DELETE policy exists, so facts
     // inserted before a later write failed are marked rejected (hidden in
