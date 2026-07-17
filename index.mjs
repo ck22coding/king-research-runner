@@ -104,8 +104,15 @@ const SECTION_ENUM = schema.properties.facts.items.properties.section.enum;
 // script) — trust-boundary validation on company data that came from the DB
 // but originated as free-text user input, before any of it is interpolated
 // into the claude -p prompt. Returns an error string, or null if valid.
+// Characters that must never be interpolated into the claude -p prompt from
+// stored or user-typed data — shared by validateInputs and the known_urls
+// hint so the unsafe set can't drift between the two checks.
+function hasUnsafePromptChars(s) {
+  return s.includes('"') || s.includes('\n');
+}
+
 function validateInputs(name, domain, newsroomUrl) {
-  if (name.includes('"') || name.includes('\n')) {
+  if (hasUnsafePromptChars(name)) {
     return 'company name must not contain double quotes or newlines';
   }
   if (!/^[A-Za-z0-9.-]+$/.test(domain)) {
@@ -313,28 +320,53 @@ function runClaude(prompt) {
   });
 }
 
+// In-flight company ids across all workers in this process. Checked and
+// updated with no await in between, so two workers can never both pass the
+// check for one company — two queued jobs for the same company must run
+// serially (concurrent runs would snapshot the same dedup history and race
+// on the companies row). Complete only because v1 runs exactly ONE runner
+// process (see the boot-recovery comment above).
+const activeCompanies = new Set();
+
 async function worker() {
-while (true) {
-  const { data: queued, error: queuedError } = await supabase
-    .from('enrichment_jobs')
-    .select('*')
-    .eq('status', 'queued')
-    .order('created_at')
-    .limit(1);
-  // Transient DB errors while polling must not crash the runner — log,
-  // sleep, retry (codex review).
-  if (queuedError) {
-    console.error(`poll error (will retry): ${queuedError.message}`);
-    await sleep(POLL_INTERVAL_MS);
-    continue;
-  }
+  while (true) {
+    // ponytail: 10-row scan window — enough to skip past a locked company's
+    // queued jobs at this scale; if all 10 are on locked companies we just
+    // wait one poll interval.
+    const { data: queued, error: queuedError } = await supabase
+      .from('enrichment_jobs')
+      .select('*')
+      .eq('status', 'queued')
+      .order('created_at')
+      .limit(10);
+    // Transient DB errors while polling must not crash the runner — log,
+    // sleep, retry (codex review).
+    if (queuedError) {
+      console.error(`poll error (will retry): ${queuedError.message}`);
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
 
-  const job = queued?.[0];
-  if (!job) {
-    await sleep(POLL_INTERVAL_MS);
-    continue;
-  }
+    const job = (queued ?? []).find((j) => !activeCompanies.has(j.company_id));
+    if (!job) {
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+    activeCompanies.add(job.company_id);
 
+    try {
+      // 'halt' means this worker's failure path could not even record a
+      // failure — stop this worker (not the process; siblings keep running).
+      if ((await runJob(job)) === 'halt') return;
+    } finally {
+      activeCompanies.delete(job.company_id);
+    }
+  }
+}
+
+// Claims and processes one queued job to a terminal state. Returns 'halt'
+// only when the failure path itself failed and this worker must stop.
+async function runJob(job) {
   const { data: claimed, error: claimError } = await supabase
     .from('enrichment_jobs')
     .update({ status: 'running', started_at: new Date().toISOString() })
@@ -344,12 +376,12 @@ while (true) {
   if (claimError) {
     console.error(`claim error (will retry): ${claimError.message}`);
     await sleep(POLL_INTERVAL_MS);
-    continue;
+    return;
   }
   if (!claimed || claimed.length === 0) {
-    // Lost a race to claim this job — defensive only, a single runner
-    // shouldn't ever hit this.
-    continue;
+    // Lost the row-level claim race to a sibling worker — routine under
+    // in-process concurrency.
+    return;
   }
 
   console.log(`claimed job ${job.id} (company ${job.company_id})`);
@@ -383,23 +415,23 @@ while (true) {
         .eq('id', job.id);
       if (jobFailError) throw jobFailError;
       console.error(`job ${job.id} failed input validation: ${inputError}`);
-      continue;
+      return;
     }
 
-    const { error: inProgressError } = await supabase
-      .from('companies')
-      .update({ status: 'in_progress' })
-      .eq('id', company.id);
+    // Independent operations (both only need company.id) — one round-trip.
+    const [{ error: inProgressError }, { data: existingSources, error: existingSourcesError }] =
+      await Promise.all([
+        supabase.from('companies').update({ status: 'in_progress' }).eq('id', company.id),
+        // No repeat suggestions: the sources table IS the log, tagged via its
+        // fact's status. Pull every URL ever suggested for this company, any
+        // status — approved, rejected, and still-pending all count.
+        supabase
+          .from('sources')
+          .select('url, facts!inner(created_at)')
+          .eq('facts.company_id', company.id)
+          .order('facts(created_at)', { ascending: false }),
+      ]);
     if (inProgressError) throw inProgressError;
-
-    // No repeat suggestions: the sources table IS the log, tagged via its
-    // fact's status. Pull every URL ever suggested for this company, any
-    // status — approved, rejected, and still-pending all count.
-    const { data: existingSources, error: existingSourcesError } = await supabase
-      .from('sources')
-      .select('url, facts!inner(created_at)')
-      .eq('facts.company_id', company.id)
-      .order('facts(created_at)', { ascending: false });
     if (existingSourcesError) throw existingSourcesError;
 
     const knownNormalized = new Set(); // authoritative, unbounded — the insert filter uses this
@@ -412,9 +444,10 @@ while (true) {
       const norm = normalizeUrl(s.url);
       if (knownNormalized.has(norm)) continue;
       knownNormalized.add(norm);
-      // Same trust-boundary concern as validateInputs(): a stray `"` or
-      // newline in a stored URL must not break the known_urls="..." arg.
-      if (knownUrls.length < EXCLUDE_URL_CAP && !s.url.includes('"') && !s.url.includes('\n')) {
+      // A stray `"`/newline must not break the known_urls="..." arg, and a
+      // comma is the list delimiter — a URL containing one would garble the
+      // list, so it stays in knownNormalized but out of the prompt hint.
+      if (knownUrls.length < EXCLUDE_URL_CAP && !hasUnsafePromptChars(s.url) && !s.url.includes(',')) {
         knownUrls.push(s.url);
       }
     }
@@ -426,8 +459,10 @@ while (true) {
     let result = await runClaude(prompt);
     // One retry for transient API failures ("API Error: 529 Overloaded" etc.)
     // — those die in seconds and cost ~no tokens, unlike a real research run.
-    // ponytail: single retry, fixed delay; a backoff loop is the upgrade path.
-    if (result.code !== 0 && /API Error: 5\d\d|overloaded/i.test(result.stdout + result.stderr)) {
+    // Alternation is scoped: a bare "overloaded" in fetched article text must
+    // NOT look transient. ponytail: single retry, fixed delay; a backoff
+    // loop is the upgrade path.
+    if (result.code !== 0 && /API Error: (5\d\d|overloaded)/i.test(result.stdout + result.stderr)) {
       console.error(`job ${job.id}: transient API error, retrying once in 60s`);
       await sleep(60_000);
       result = await runClaude(prompt);
@@ -506,10 +541,16 @@ while (true) {
     // Loud failure: macOS banner so a dead run is never silent. The web UI
     // shows the same error on the company row; this covers eyes-off-the-app.
     try {
-      spawn('osascript', [
+      const banner = spawn('osascript', [
         '-e',
-        `display notification "${String(err.message).slice(0, 120).replace(/"/g, "'")}" with title "CRM runner: job failed"`,
+        // Backslashes are escape intros inside AppleScript string literals
+        // (and routine in error text that embeds JSON snippets) — swap them
+        // out along with quotes or the banner itself dies silently.
+        `display notification "${String(err.message).slice(0, 120).replace(/[\\"]/g, "'")}" with title "CRM runner: job failed"`,
       ]);
+      // spawn failures surface as an async 'error' event; unhandled, that
+      // crashes the whole process from inside the notification path.
+      banner.on('error', () => {});
     } catch {
       // Notification is best-effort — never let it mask the real failure path.
     }
@@ -551,12 +592,15 @@ while (true) {
       .eq('id', job.id);
     if (failWriteError || restoreError) {
       console.error(
-        `FATAL: failure-path write failed (job: ${failWriteError?.message ?? 'ok'}, company: ${restoreError?.message ?? 'ok'}) — exiting so boot crash-recovery resets state on restart`
+        `FATAL: failure-path write failed (job: ${failWriteError?.message ?? 'ok'}, company: ${restoreError?.message ?? 'ok'}) — halting this worker; boot crash-recovery resets the job on next restart`
       );
-      process.exit(1);
+      // Not process.exit(1): that would kill sibling workers mid-write,
+      // stranding their facts and companies. Halt this worker alone; the
+      // process exits (code 1) only once every worker has halted.
+      process.exitCode = 1;
+      return 'halt';
     }
   }
-}
 }
 
 await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
