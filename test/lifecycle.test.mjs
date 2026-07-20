@@ -150,11 +150,42 @@ test('lifecycle: a job stuck running at boot is not wedged (crash recovery)', as
   const { runner, userId } = await signInRunner();
   const companyId = await findOrCreateRunnerTestCo(runner, userId);
 
-  // Simulate a crashed prior run: a job left in 'running' before this
-  // runner process ever starts. Boot-time recovery must reset it to
-  // 'queued' so the main loop picks it up like any other job — if
-  // recovery is missing, this job stays 'running' forever and the
-  // poll below times out.
+  // Simulate a crashed prior run: a job left 'running' with a started_at far
+  // enough in the past that it can only be a crashed run, never a genuinely
+  // in-flight one (see index.mjs's CRASH_RECOVERY_STALE_MS — comfortably
+  // under an hour even at the default 20-minute CLAUDE_TIMEOUT_MS, so 3
+  // hours ago is unambiguously stale). Boot-time recovery must reset it to
+  // 'queued' so the main loop picks it up like any other job — if recovery
+  // is missing (or the staleness gate wrongly excludes it), this job stays
+  // 'running' forever and the poll below times out.
+  const staleStartedAt = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ company_id: companyId, status: 'running', requested_by: userId, started_at: staleStartedAt })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  const child = spawnRunner(FIXTURE_SUCCESS);
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  const finalJob = await pollUntilTerminal(runner, job.id);
+  assert.equal(finalJob.status, 'done', `expected crash-recovered job to finish done, got '${finalJob.status}' (error=${finalJob.error})`);
+});
+
+test('lifecycle: a fresh running job is left alone by a concurrently-started instance (no double-run)', async (t) => {
+  const { runner, userId } = await signInRunner();
+  const companyId = await findOrCreateRunnerTestCo(runner, userId);
+
+  // Simulates a second instance starting while a first is genuinely mid-job
+  // (e.g. a manual run overlapping a launchd tick): started_at is fresh
+  // (now), well inside the staleness window. Boot crash-recovery on this new
+  // instance must NOT reset it — a reset here would yank an in-flight job
+  // back to 'queued', where it could be re-claimed and re-run: real, paid
+  // research executed twice.
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
     .insert({ company_id: companyId, status: 'running', requested_by: userId, started_at: new Date().toISOString() })
@@ -168,8 +199,21 @@ test('lifecycle: a job stuck running at boot is not wedged (crash recovery)', as
     await cleanup(runner, companyId, job.id);
   });
 
-  const finalJob = await pollUntilTerminal(runner, job.id);
-  assert.equal(finalJob.status, 'done', `expected crash-recovered job to finish done, got '${finalJob.status}' (error=${finalJob.error})`);
+  // The new instance's boot-time reset runs once, synchronously, before its
+  // poll loop starts — give it a moment, then confirm the job is untouched
+  // (still 'running', not bounced back to 'queued' and picked up again).
+  await sleep(3000);
+  const { data: stillRunning, error: stillRunningError } = await runner
+    .from('enrichment_jobs')
+    .select('status')
+    .eq('id', job.id)
+    .single();
+  if (stillRunningError) throw stillRunningError;
+  assert.equal(
+    stillRunning.status,
+    'running',
+    'expected a fresh running job to be left alone by a concurrently-started instance'
+  );
 });
 
 test('lifecycle: invalid fixture fails the job with zero writes and restores company status', async (t) => {

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.kingresearch.runner</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/carterking/.local/share/fnm/aliases/default/bin/node</string>
+		<string>/Users/carterking/Projects/dad/runner/index.mjs</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/carterking/Projects/dad/runner</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>RUNNER_ONCE</key>
+		<string>1</string>
+		<key>CLAUDE_BIN</key>
+		<string>/Users/carterking/.local/bin/claude</string>
+	</dict>
+
+	<!-- Fire every 60s. launchd will NOT start a second instance while one
+	     from a prior tick is still running, and if the Mac was asleep/off
+	     when a tick would have fired, it runs the missed tick once on wake
+	     rather than making up for every skipped interval. -->
+	<key>StartInterval</key>
+	<integer>60</integer>
+
+	<!-- Also run once right after load/login, instead of waiting a full
+	     60s for the first tick. -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>/Users/carterking/Projects/dad/runner/launchd/runner.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/carterking/Projects/dad/runner/launchd/runner.stderr.log</string>
+</dict>
+</plist>

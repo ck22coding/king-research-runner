@@ -57,6 +57,11 @@ const RUNNER_MODEL = process.env.RUNNER_MODEL || '';
 // Clamped to [1, 8]: negative/NaN/fractional env values fall back sanely and
 // a fat-fingered large value can't stampede the DB or the claude CLI.
 const CONCURRENCY = Math.min(8, Math.max(1, Math.trunc(Number(process.env.RUNNER_CONCURRENCY)) || 2));
+// On-demand mode: drain whatever is queued right now, then exit — no resident
+// daemon. A launchd LaunchAgent (see launchd/) fires this on an interval
+// instead of a `while(true)` process staying up. `--once` is accepted as a
+// CLI flag too so it's easy to try by hand alongside the env var.
+const RUNNER_ONCE = process.env.RUNNER_ONCE === '1' || process.argv.includes('--once');
 
 let CLAUDE_BIN;
 try {
@@ -239,16 +244,29 @@ function checkAgainstSchema(structured) {
   return null;
 }
 
-// ponytail: single-runner ceiling. A job found 'running' at boot can only be
-// a crashed prior run of THIS runner (v1 assumes exactly one runner process
-// — see BUILD.md "Out of scope for v1"). Blanket-resetting every 'running'
-// row to 'queued' is correct only under that assumption; a multi-runner
-// setup needs per-job leases (e.g. a claimed_by + heartbeat column) instead
-// of this global reset, or two runners could both grab the same crashed job.
+// On-demand starts are short-lived and frequent (launchd fires every 60s),
+// so it's routine for a second instance to start while a first is still
+// genuinely mid-job (a manual run overlapping a launchd tick, or two ticks
+// overlapping if a run ever took >60s). A blanket reset of every 'running'
+// row would yank that in-flight job back to 'queued' out from under the
+// still-running instance — it could then get re-claimed and re-run, i.e. a
+// real, paid claude -p research call executed twice.
+//
+// Fix: only reset rows whose claim (started_at) is older than a staleness
+// threshold comfortably beyond the longest a job can legitimately still be
+// running. That worst case is two claude -p attempts (the one transient-
+// error retry) plus the 60s retry sleep and both kill-grace windows, plus a
+// safety margin — so a row this old was never going to still be running; it
+// can only be a crashed prior run. A genuinely-in-flight job's started_at is
+// always well inside this window, so a concurrently-started instance leaves
+// it alone. Tradeoff: a real crash isn't unwedged until the row goes stale,
+// not on the very next start — correct-but-slower beats fast-but-unsafe here.
+const CRASH_RECOVERY_STALE_MS = 2 * CLAUDE_TIMEOUT_MS + 60_000 + 2 * CLAUDE_KILL_GRACE_MS + 60_000;
 const { error: recoverError } = await supabase
   .from('enrichment_jobs')
   .update({ status: 'queued' })
-  .eq('status', 'running');
+  .eq('status', 'running')
+  .lt('started_at', new Date(Date.now() - CRASH_RECOVERY_STALE_MS).toISOString());
 if (recoverError) {
   console.error(`FATAL: crash-recovery reset failed: ${recoverError.message}`);
   process.exit(1);
@@ -358,6 +376,15 @@ async function worker() {
 
     const job = (queued ?? []).find((j) => !activeCompanies.has(j.company_id));
     if (!job) {
+      // Once-mode: nothing claimable right now (queue empty, or every queued
+      // row belongs to a company a sibling worker is already mid-job on).
+      // Return instead of sleeping — a sibling still holding a company lock
+      // keeps looping and will pick up any job behind it once it frees that
+      // lock, so no job is stranded (see README "How it runs jobs").
+      if (RUNNER_ONCE) {
+        console.log('once-mode: no claimable job, worker exiting');
+        return;
+      }
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
@@ -613,3 +640,9 @@ async function runJob(job) {
 }
 
 await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+// Once-mode only reaches here: every worker drained the queue and returned.
+// No explicit process.exit() needed — nothing left keeps the event loop
+// alive (the Supabase auth client's refresh timer is unref'd), so the
+// process exits on its own with whatever process.exitCode was set (0
+// unless a worker halted above).
+if (RUNNER_ONCE) console.log('once-mode: queue drained, exiting');
