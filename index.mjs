@@ -4,7 +4,8 @@
 // suggested facts/sources back to the DB.
 import { execSync, spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createInterface } from 'node:readline/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
@@ -14,33 +15,15 @@ import { createClient } from '@supabase/supabase-js';
 const PLUGIN_DIR = '/Users/carterking/Projects/dad/company-preview/skill/plugins/company-preview';
 const SCHEMA_PATH = path.join(PLUGIN_DIR, 'references', 'output-schema.json');
 
-// Root .env is read in place — never copied alongside this repo. It holds
-// the runner's credentials and the Supabase project config.
-const ENV_PATH = '/Users/carterking/Projects/dad/.env';
-try {
-  process.loadEnvFile(ENV_PATH);
-} catch (err) {
-  console.error(
-    `FATAL: could not read env file at ${ENV_PATH} (${err.message}). ` +
-      'This file is read in place from the dad/ project root — it is never copied into runner/.'
-  );
-  process.exit(1);
-}
+// Optional env file: dev/tests point KR_ENV_FILE at the project .env;
+// npx users have neither and that's fine — defaults below cover them.
+try { process.loadEnvFile(process.env.KR_ENV_FILE ?? '.env'); } catch {}
 
-const REQUIRED_ENV = [
-  'RUNNER_EMAIL',
-  'RUNNER_PASSWORD',
-  'NEXT_PUBLIC_SUPABASE_URL',
-  'NEXT_PUBLIC_SUPABASE_ANON_KEY',
-];
-const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
-if (missing.length > 0) {
-  console.error(`FATAL: missing required env var(s) in ${ENV_PATH}: ${missing.join(', ')}`);
-  process.exit(1);
-}
-
-const { RUNNER_EMAIL, RUNNER_PASSWORD, NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY } =
-  process.env;
+// URL + anon key get baked public defaults (they are public by design; RLS
+// is the security boundary) so npx users with no env file still work.
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://dtwztzbvewheadjawdnb.supabase.co';
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'sb_publishable_kpWYw4Tud5geXMr_bzDaDQ_NRPk76t_';
+const SITE_URL = process.env.KR_SITE_URL || 'https://king-research.vercel.app';
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 5000;
 // Hard ceiling on a single claude -p run. Env-overridable for tests; default
 // is generous because real research runs take 5-15 minutes (see BUILD.md).
@@ -93,17 +76,53 @@ try {
   process.exit(1);
 }
 
-const supabase = createClient(NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY);
-const { error: signInError } = await supabase.auth.signInWithPassword({
-  email: RUNNER_EMAIL,
-  password: RUNNER_PASSWORD,
-});
-if (signInError) {
-  console.error(`FATAL: sign-in failed for ${RUNNER_EMAIL}: ${signInError.message}`);
-  process.exit(1);
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Runner identity: a stored refresh token (from pairing) is refreshed on
+// every start; failing that, a TTY prompts for a fresh pairing code; failing
+// that (e.g. a daemon/background context), exit loudly rather than hang.
+const CRED_PATH = process.env.KR_CREDENTIALS_PATH || path.join(os.homedir(), '.king-research', 'credentials.json');
+
+function saveCreds(session) {
+  mkdirSync(path.dirname(CRED_PATH), { recursive: true });
+  writeFileSync(CRED_PATH, JSON.stringify({ refresh_token: session.refresh_token }), { mode: 0o600 });
 }
 
-console.log(`runner started: queue '${RUNNER_QUEUE}' as ${RUNNER_EMAIL}, claude at ${CLAUDE_BIN}, worker ${WORKER_ID}`);
+async function ensureSession() {
+  let stored = null;
+  try { stored = JSON.parse(readFileSync(CRED_PATH, 'utf8')); } catch {}
+  if (stored?.refresh_token) {
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token: stored.refresh_token });
+    if (!error) { saveCreds(data.session); return data.session.user; }
+    console.error(`Stored login rejected (${error.message}).`);
+  }
+  if (!process.stdin.isTTY) {
+    console.error('No valid login. Run this command in a terminal and re-pair this computer (Onboarding page → Connect this computer).');
+    process.exit(1);
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const code = (await rl.question('Paste the pairing code from the website (Onboarding → Connect this computer): ')).trim();
+  rl.close();
+  const res = await fetch(new URL('/api/runner/pair', SITE_URL), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  if (!res.ok) {
+    console.error(`Pairing failed: ${(await res.json().catch(() => ({}))).error ?? res.status}`);
+    process.exit(1);
+  }
+  const { token_hash } = await res.json();
+  const { data, error } = await supabase.auth.verifyOtp({ type: 'email', token_hash });
+  if (error) { console.error(`Pairing failed: ${error.message}`); process.exit(1); }
+  saveCreds(data.session);
+  return data.session.user;
+}
+
+const ME = await ensureSession();
+console.log(`signed in as ${ME.email}`);
+
+console.log(`runner started: queue '${RUNNER_QUEUE}' as ${ME.email}, claude at ${CLAUDE_BIN}, worker ${WORKER_ID}`);
 
 let schemaText;
 let schema;
