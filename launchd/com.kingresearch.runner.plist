@@ -20,6 +20,11 @@
 		<string>1</string>
 		<key>CLAUDE_BIN</key>
 		<string>/Users/carterking/.local/bin/claude</string>
+		<!-- Real-money guard: launchd only ever works the prod queue. Test
+		     suites set RUNNER_QUEUE=test-<pid>-<ts> so a tick firing during a
+		     test run can neither see fixtures nor be seen by them. -->
+		<key>RUNNER_QUEUE</key>
+		<string>prod</string>
 	</dict>
 
 	<!-- Fire every 60s. launchd will NOT start a second instance while one

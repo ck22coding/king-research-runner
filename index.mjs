@@ -5,6 +5,7 @@
 import { execSync, spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
 
@@ -62,6 +63,21 @@ const CONCURRENCY = Math.min(8, Math.max(1, Math.trunc(Number(process.env.RUNNER
 // instead of a `while(true)` process staying up. `--once` is accepted as a
 // CLI flag too so it's easy to try by hand alongside the env var.
 const RUNNER_ONCE = process.env.RUNNER_ONCE === '1' || process.argv.includes('--once');
+// Queue namespace (migration §F): launchd runs 'prod'; tests set
+// RUNNER_QUEUE=test-<pid>-<ts>. Every recovery/poll/claim query filters on
+// this — the boundary that keeps a test run from triggering REAL paid
+// research and the prod runner from claiming test fixtures.
+const RUNNER_QUEUE = process.env.RUNNER_QUEUE || 'prod';
+// Lease identity + cadence (migration §E). One id per process is enough:
+// in-process workers never contest a row after the atomic claim; the lease
+// protects against OTHER processes.
+const WORKER_ID = `${os.hostname()}:${process.pid}:${Date.now()}`;
+const HEARTBEAT_MS = 30_000;
+// Stale = many missed beats. Client-clock based (PostgREST can't filter on
+// now() without an RPC) — generous enough that minutes of skew stay safe,
+// and still unwedges a crash in ~5 min instead of the old ~42.
+// ponytail: an RPC comparing against DB now() is the upgrade path.
+const LEASE_STALE_MS = 10 * HEARTBEAT_MS;
 
 let CLAUDE_BIN;
 try {
@@ -87,7 +103,7 @@ if (signInError) {
   process.exit(1);
 }
 
-console.log(`runner started: signed in as ${RUNNER_EMAIL}, claude binary resolved to ${CLAUDE_BIN}`);
+console.log(`runner started: queue '${RUNNER_QUEUE}' as ${RUNNER_EMAIL}, claude at ${CLAUDE_BIN}, worker ${WORKER_ID}`);
 
 let schemaText;
 let schema;
@@ -130,6 +146,10 @@ function validateInputs(name, domain, newsroomUrl) {
   }
   return null;
 }
+
+// Thrown when this worker can no longer prove it owns a job's lease — the
+// catch path must NOT write to the job/company (another owner has them).
+class LeaseLostError extends Error {}
 
 function snippet(s, n = 300) {
   if (!s) return '(empty)';
@@ -215,7 +235,7 @@ function checkAgainstSchema(structured) {
       if (!(key in fact)) return `facts[${i}] missing required key: ${key}`;
     }
     if (!SECTION_ENUM.includes(fact.section)) {
-      return `facts[${i}].section '${fact.section}' is not one of the 8-value enum`;
+      return `facts[${i}].section '${fact.section}' is not in the schema's section enum`;
     }
     // Nested sources must be fully valid BEFORE any DB write — facts insert
     // first, so a malformed source discovered mid-write would strand
@@ -244,29 +264,23 @@ function checkAgainstSchema(structured) {
   return null;
 }
 
-// On-demand starts are short-lived and frequent (launchd fires every 60s),
-// so it's routine for a second instance to start while a first is still
-// genuinely mid-job (a manual run overlapping a launchd tick, or two ticks
-// overlapping if a run ever took >60s). A blanket reset of every 'running'
-// row would yank that in-flight job back to 'queued' out from under the
-// still-running instance — it could then get re-claimed and re-run, i.e. a
-// real, paid claude -p research call executed twice.
-//
-// Fix: only reset rows whose claim (started_at) is older than a staleness
-// threshold comfortably beyond the longest a job can legitimately still be
-// running. That worst case is two claude -p attempts (the one transient-
-// error retry) plus the 60s retry sleep and both kill-grace windows, plus a
-// safety margin — so a row this old was never going to still be running; it
-// can only be a crashed prior run. A genuinely-in-flight job's started_at is
-// always well inside this window, so a concurrently-started instance leaves
-// it alone. Tradeoff: a real crash isn't unwedged until the row goes stale,
-// not on the very next start — correct-but-slower beats fast-but-unsafe here.
-const CRASH_RECOVERY_STALE_MS = 2 * CLAUDE_TIMEOUT_MS + 60_000 + 2 * CLAUDE_KILL_GRACE_MS + 60_000;
+// Crash recovery via the heartbeat lease (migration §E): a live worker
+// stamps heartbeat_at every HEARTBEAT_MS, so 'running' rows whose heartbeat
+// has gone quiet for LEASE_STALE_MS can only be crashed prior runs — a
+// genuinely in-flight job's heartbeat is always fresh, so a concurrently
+// started instance leaves it alone (no double-paid research), and a real
+// crash is unwedged in minutes, not the old ~42 (loud-failure requirement).
+// heartbeat_at IS NULL covers rows claimed by pre-lease code (or a crash
+// between claim and first beat) — with the old code retired, any such
+// running row is by definition dead. Scoped to this queue so a prod sweep
+// can't yank a parallel test run's rows (and vice versa).
+const staleCutoff = new Date(Date.now() - LEASE_STALE_MS).toISOString();
 const { error: recoverError } = await supabase
   .from('enrichment_jobs')
-  .update({ status: 'queued' })
+  .update({ status: 'queued', claimed_by: null, heartbeat_at: null })
   .eq('status', 'running')
-  .lt('started_at', new Date(Date.now() - CRASH_RECOVERY_STALE_MS).toISOString());
+  .eq('queue_name', RUNNER_QUEUE)
+  .or(`heartbeat_at.is.null,heartbeat_at.lt.${staleCutoff}`);
 if (recoverError) {
   console.error(`FATAL: crash-recovery reset failed: ${recoverError.message}`);
   process.exit(1);
@@ -279,7 +293,10 @@ if (recoverError) {
 // place. Hard-times-out at CLAUDE_TIMEOUT_MS: SIGTERM first, then SIGKILL if
 // the child hasn't exited after CLAUDE_KILL_GRACE_MS — a run that hangs
 // (network stall, runaway agent loop, etc.) must never wedge the queue.
-function runClaude(prompt) {
+// `killRef` (optional): populated with a .kill() so the caller's heartbeat
+// loop can terminate the child when the job lease is lost — a run we no
+// longer own must stop burning real research immediately.
+function runClaude(prompt, killRef) {
   return new Promise((resolve) => {
     const child = spawn(
       CLAUDE_BIN,
@@ -333,6 +350,7 @@ function runClaude(prompt) {
       }
       return true;
     };
+    if (killRef) killRef.kill = () => child.kill('SIGKILL');
     child.stdout.on('data', (d) => capped(d) && (stdout += d));
     child.stderr.on('data', (d) => capped(d) && (stderr += d));
     child.on('error', (spawnError) => finish({ stdout, stderr, code: null, spawnError, timedOut, overflowed }));
@@ -364,6 +382,7 @@ async function worker() {
       .from('enrichment_jobs')
       .select('*')
       .eq('status', 'queued')
+      .eq('queue_name', RUNNER_QUEUE)
       .order('created_at')
       .limit(10);
     // Transient DB errors while polling must not crash the runner — log,
@@ -407,11 +426,20 @@ async function worker() {
 // Claims and processes one queued job to a terminal state. Returns 'halt'
 // only when the failure path itself failed and this worker must stop.
 async function runJob(job) {
+  // Atomic lease claim (migration §E): stamps ownership + first heartbeat in
+  // the same conditional update. queue_name guard is belt-and-braces — the
+  // poll already filters, but a claim must never cross queues.
   const { data: claimed, error: claimError } = await supabase
     .from('enrichment_jobs')
-    .update({ status: 'running', started_at: new Date().toISOString() })
+    .update({
+      status: 'running',
+      started_at: new Date().toISOString(),
+      claimed_by: WORKER_ID,
+      heartbeat_at: new Date().toISOString(),
+    })
     .eq('id', job.id)
     .eq('status', 'queued')
+    .eq('queue_name', RUNNER_QUEUE)
     .select();
   if (claimError) {
     console.error(`claim error (will retry): ${claimError.message}`);
@@ -464,7 +492,7 @@ async function runJob(job) {
         supabase.from('companies').update({ status: 'in_progress' }).eq('id', company.id),
         // No repeat suggestions: the sources table IS the log, tagged via its
         // fact's status. Pull every URL ever suggested for this company, any
-        // status — approved, rejected, and still-pending all count.
+        // status — included and removed both count.
         supabase
           .from('sources')
           .select('url, facts!inner(created_at)')
@@ -495,17 +523,65 @@ async function runJob(job) {
 
     const prompt = `/company-preview name="${company.name}" domain="${company.domain}" newsroom_url="${company.newsroom_url ?? ''}"${knownUrlsArg}`;
 
+    // Heartbeat lease renewal (migration §E) for as long as claude -p runs.
+    // Each beat is guarded on (id, running, claimed_by=me): zero rows back
+    // means the row is no longer ours (stale-sweep reclaimed it) — kill the
+    // child NOW so a run we don't own stops burning real research, and stop
+    // writing. Repeated renewal errors (network down) get the same treatment:
+    // we can't prove we still hold the lease, so we must not keep spending.
+    const killRef = {};
+    let leaseLost = false;
+    let beatFailures = 0;
+    const heartbeat = setInterval(async () => {
+      const { data: beat, error: beatError } = await supabase
+        .from('enrichment_jobs')
+        .update({ heartbeat_at: new Date().toISOString() })
+        .eq('id', job.id)
+        .eq('status', 'running')
+        .eq('claimed_by', WORKER_ID)
+        .select('id');
+      if (beatError) {
+        beatFailures += 1;
+        console.error(`job ${job.id}: heartbeat renewal error ${beatFailures}/3: ${beatError.message}`);
+        if (beatFailures < 3) return;
+      } else if (beat && beat.length > 0) {
+        beatFailures = 0;
+        return;
+      }
+      // Lost the lease (or can't prove we hold it) — stop the spend.
+      leaseLost = true;
+      clearInterval(heartbeat);
+      console.error(`job ${job.id}: lease lost — killing claude child and abandoning the job`);
+      killRef.kill?.();
+    }, HEARTBEAT_MS);
+
     console.log(`invoking claude -p for company ${company.id} (${company.name})`);
-    let result = await runClaude(prompt);
-    // One retry for transient API failures ("API Error: 529 Overloaded" etc.)
-    // — those die in seconds and cost ~no tokens, unlike a real research run.
-    // Alternation is scoped: a bare "overloaded" in fetched article text must
-    // NOT look transient. ponytail: single retry, fixed delay; a backoff
-    // loop is the upgrade path.
-    if (result.code !== 0 && /API Error: (5\d\d|overloaded)/i.test(result.stdout + result.stderr)) {
-      console.error(`job ${job.id}: transient API error, retrying once in 60s`);
-      await sleep(60_000);
-      result = await runClaude(prompt);
+    let result;
+    try {
+      result = await runClaude(prompt, killRef);
+      // One retry for transient API failures ("API Error: 529 Overloaded" etc.)
+      // — those die in seconds and cost ~no tokens, unlike a real research run.
+      // Alternation is scoped: a bare "overloaded" in fetched article text must
+      // NOT look transient. ponytail: single retry, fixed delay; a backoff
+      // loop is the upgrade path.
+      if (
+        !leaseLost &&
+        result.code !== 0 &&
+        /API Error: (5\d\d|overloaded)/i.test(result.stdout + result.stderr)
+      ) {
+        console.error(`job ${job.id}: transient API error, retrying once in 60s`);
+        await sleep(60_000);
+        if (!leaseLost) result = await runClaude(prompt, killRef);
+      }
+    } finally {
+      clearInterval(heartbeat);
+    }
+
+    if (leaseLost) {
+      // Another owner has (or will re-run) this job — no terminal writes, no
+      // company restore, nothing inserted yet (facts insert below). The loud
+      // failure still fires so an operator knows this instance lost a lease.
+      throw new LeaseLostError(`job ${job.id}: lease lost mid-run; result discarded`);
     }
 
     // Hard gate: must run to completion, and pass, before any facts/sources/
@@ -529,13 +605,31 @@ async function runJob(job) {
       console.log(`job ${job.id}: skipped ${skipped} repeat fact(s) for company ${company.id}`);
     }
 
+    // Final lease check before the write phase: one guarded renewal. If the
+    // row is no longer ours, a new owner will re-run the research — writing
+    // our facts would duplicate theirs. (A loss in the seconds between this
+    // check and the writes below is caught by the guarded job-done write.)
+    const { data: preWriteBeat, error: preWriteBeatError } = await supabase
+      .from('enrichment_jobs')
+      .update({ heartbeat_at: new Date().toISOString() })
+      .eq('id', job.id)
+      .eq('status', 'running')
+      .eq('claimed_by', WORKER_ID)
+      .select('id');
+    if (preWriteBeatError) throw preWriteBeatError;
+    if (!preWriteBeat || preWriteBeat.length === 0) {
+      throw new LeaseLostError(`job ${job.id}: lease lost before write phase; result discarded`);
+    }
+
     const factRows = newFacts.map((f) => ({
       company_id: company.id,
       section: f.section,
       text: f.text,
       fact_date: f.fact_date,
       group_key: f.group_key,
-      // status defaults to 'suggested' — not set here.
+      stats: f.stats ?? null,
+      importance: f.importance ?? null,
+      // status defaults to 'included' — §E auto-include, not set here.
     }));
     const { data: insertedFacts, error: factsError } = await supabase.from('facts').insert(factRows).select('id');
     if (factsError) throw factsError;
@@ -565,11 +659,21 @@ async function runJob(job) {
       .eq('id', company.id);
     if (companyDoneError) throw companyDoneError;
 
-    const { error: jobDoneError } = await supabase
+    // Owner-guarded commit (migration §E): a reclaimed worker must not
+    // overwrite the new owner's result. Zero rows back = we lost the lease
+    // during the write phase — compensate our facts (the new owner's run
+    // will re-insert its own) and bail without touching the company further.
+    const { data: doneRows, error: jobDoneError } = await supabase
       .from('enrichment_jobs')
       .update({ status: 'done', finished_at: new Date().toISOString() })
-      .eq('id', job.id);
+      .eq('id', job.id)
+      .eq('status', 'running')
+      .eq('claimed_by', WORKER_ID)
+      .select('id');
     if (jobDoneError) throw jobDoneError;
+    if (!doneRows || doneRows.length === 0) {
+      throw new LeaseLostError(`job ${job.id}: lease lost during write phase; marking this run's facts removed`);
+    }
 
     console.log(`done: job ${job.id} (company ${company.id}), previous company status was '${previousStatus}'`);
   } catch (err) {
@@ -577,6 +681,7 @@ async function runJob(job) {
     // gate, etc.) lands here: job failed + company restored, never a crashed
     // process or a wedged queue.
     console.error(`job ${job.id} failed: ${err.message}`);
+    const leaseWasLost = err instanceof LeaseLostError;
 
     // Loud failure: macOS banner so a dead run is never silent. The web UI
     // shows the same error on the company row; this covers eyes-off-the-app.
@@ -592,20 +697,27 @@ async function runJob(job) {
     banner.on('error', () => {});
 
     // Compensation for partial writes: no DELETE policy exists, so facts
-    // inserted before a later write failed are marked rejected (hidden in
-    // the UI). ponytail: an insert_brief RPC (one transaction) is the
-    // upgrade path if orphaned-rejected rows ever matter (codex review).
+    // inserted before a later write failed are marked removed (hidden from
+    // the report + Source, still in History). Runs for lease-lost too — our
+    // rows would duplicate the new owner's. ponytail: an insert_brief RPC
+    // (one transaction) is the upgrade path if orphaned-removed rows ever
+    // matter (codex review).
     if (insertedFactIds.length > 0) {
       const { error: compError } = await supabase
         .from('facts')
-        .update({ status: 'rejected' })
+        .update({ status: 'removed' })
         .in('id', insertedFactIds);
       if (compError) {
         console.error(
-          `compensation failed — ${insertedFactIds.length} suggested fact(s) from failed job ${job.id} left behind: ${compError.message}`
+          `compensation failed — ${insertedFactIds.length} fact(s) from failed job ${job.id} left behind: ${compError.message}`
         );
       }
     }
+
+    // Lease lost: the job/company belong to another owner now — recording a
+    // failure or restoring the company would fight their writes. The banner
+    // above already made the loss loud; stop here.
+    if (leaseWasLost) return;
 
     // The failure-path writes themselves must be checked: supabase-js
     // returns {error}, it doesn't throw. If we can't record the failure,
@@ -622,10 +734,14 @@ async function runJob(job) {
         .update({ status: previousStatus })
         .eq('id', job.company_id));
     }
+    // Owner-guarded like the success commit — if the lease was swept while
+    // we were failing, the new owner's state wins and 0 rows come back
+    // (fine: their run supersedes this failure record).
     const { error: failWriteError } = await supabase
       .from('enrichment_jobs')
       .update({ status: 'failed', error: err.message, finished_at: new Date().toISOString() })
-      .eq('id', job.id);
+      .eq('id', job.id)
+      .eq('claimed_by', WORKER_ID);
     if (failWriteError || restoreError) {
       console.error(
         `FATAL: failure-path write failed (job: ${failWriteError?.message ?? 'ok'}, company: ${restoreError?.message ?? 'ok'}) — halting this worker; boot crash-recovery resets the job on next restart`
