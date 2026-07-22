@@ -676,6 +676,7 @@ async function worker() {
       .select('*')
       .eq('status', 'queued')
       .eq('queue_name', RUNNER_QUEUE)
+      .eq('requested_by', ME.id)
       .order('created_at')
       .limit(10);
     // Transient DB errors while polling must not crash the runner — log,
@@ -733,6 +734,7 @@ async function runJob(job) {
     .eq('id', job.id)
     .eq('status', 'queued')
     .eq('queue_name', RUNNER_QUEUE)
+    .eq('requested_by', ME.id)
     .select();
   if (claimError) {
     console.error(`claim error (will retry): ${claimError.message}`);
@@ -1126,6 +1128,21 @@ if (resynthIdx !== -1) {
   await runSynthesisPass(companyId);
   process.exit(0);
 }
+
+// Presence: one row per user, upserted every POLL_INTERVAL_MS; the web
+// "runner offline" banner treats a stale (>120s) or missing row as offline.
+// Timer is unref'd like the auth client's refresh timer (see the comment
+// below) — it must never be the reason this process fails to exit once
+// every worker drains.
+async function beatOnce() {
+  const { error } = await supabase
+    .from('runner_heartbeats')
+    .upsert({ user_id: ME.id, last_seen_at: new Date().toISOString(), hostname: os.hostname() });
+  if (error) console.error(`heartbeat failed: ${error.message}`);
+}
+await beatOnce();
+const heartbeatTimer = setInterval(beatOnce, POLL_INTERVAL_MS);
+heartbeatTimer.unref();
 
 await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 // Once-mode only reaches here: every worker drained the queue and returned.

@@ -6,33 +6,34 @@
 // as any other claude failure (see index.mjs's runClaude/checkShape).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { signInRunner, findOrCreateRunnerTestCo } from './helpers.mjs';
+import { signInRunner, signInTestUser, spawnPaired, findOrCreateRunnerTestCo } from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RUNNER_ROOT = path.join(__dirname, '..');
-const INDEX = path.join(RUNNER_ROOT, 'index.mjs');
 const FIXTURE_HANG = path.join(__dirname, 'fixtures', 'fake-claude-hang.mjs');
 
 const POLL_INTERVAL_MS = 500;
 const POLL_TIMEOUT_MS = 10000;
 const CLAUDE_TIMEOUT_MS = 2000;
 
-function spawnRunner(claudeBin) {
-  const env = {
-    ...process.env,
+// Pairs the spawned runner as the SAME fixture user signInRunner()'s caller
+// uses (so its requested_by = ME.id claims match the fixture job below) —
+// index.mjs no longer reads RUNNER_EMAIL/RUNNER_PASSWORD (Task 5).
+async function spawnRunner(claudeBin) {
+  const session = await signInTestUser();
+  return spawnPaired(session, {
     CLAUDE_BIN: claudeBin,
     POLL_INTERVAL_MS: String(POLL_INTERVAL_MS),
     CLAUDE_TIMEOUT_MS: String(CLAUDE_TIMEOUT_MS),
-  };
-  return spawn(process.execPath, [INDEX], { cwd: RUNNER_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  });
 }
 
+// spawnPaired's handle wraps the child process (no raw exitCode/signalCode);
+// its .kill() is a harmless no-op if the process already exited.
 function killChild(child) {
-  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  child.kill('SIGKILL');
 }
 
 // Same shape as lifecycle.test.mjs's poller: returns whatever the row looks
@@ -81,7 +82,7 @@ test('timeout: a hung claude run is killed and the job fails with a timeout erro
     .single();
   if (jobError) throw jobError;
 
-  const child = spawnRunner(FIXTURE_HANG);
+  const child = await spawnRunner(FIXTURE_HANG);
   t.after(async () => {
     killChild(child);
     await cleanup(runner, companyId, job.id);

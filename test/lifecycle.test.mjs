@@ -7,15 +7,12 @@
 // crash (thrown error, hung process, unhandled rejection) would not be.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { signInRunner, findOrCreateRunnerTestCo, findOrCreateCompany } from './helpers.mjs';
+import { signInRunner, signInTestUser, spawnPaired, findOrCreateRunnerTestCo, findOrCreateCompany } from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RUNNER_ROOT = path.join(__dirname, '..');
-const INDEX = path.join(RUNNER_ROOT, 'index.mjs');
 const FIXTURE_SUCCESS = path.join(__dirname, 'fixtures', 'fake-claude-success.mjs');
 const FIXTURE_INVALID = path.join(__dirname, 'fixtures', 'fake-claude-invalid.mjs');
 const FIXTURE_BAD_SCHEMA = path.join(__dirname, 'fixtures', 'fake-claude-bad-schema.mjs');
@@ -24,13 +21,20 @@ const FIXTURE_REPEAT = path.join(__dirname, 'fixtures', 'fake-claude-repeat.mjs'
 const POLL_INTERVAL_MS = 1000;
 const POLL_TIMEOUT_MS = 30000;
 
-function spawnRunner(claudeBin) {
-  const env = { ...process.env, CLAUDE_BIN: claudeBin, POLL_INTERVAL_MS: String(POLL_INTERVAL_MS) };
-  return spawn(process.execPath, [INDEX], { cwd: RUNNER_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+// Pairs the spawned runner as the SAME fixture user signInRunner()'s caller
+// uses (so its requested_by = ME.id claims match the fixture jobs below) —
+// index.mjs no longer reads RUNNER_EMAIL/RUNNER_PASSWORD (Task 5), so
+// passing CLAUDE_BIN/POLL_INTERVAL_MS alone is no longer enough to get it
+// signed in.
+async function spawnRunner(claudeBin) {
+  const session = await signInTestUser();
+  return spawnPaired(session, { CLAUDE_BIN: claudeBin, POLL_INTERVAL_MS: String(POLL_INTERVAL_MS) });
 }
 
+// spawnPaired's handle wraps the child process (no raw exitCode/signalCode);
+// its .kill() is a harmless no-op if the process already exited.
 function killChild(child) {
-  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  child.kill('SIGKILL');
 }
 
 // Polls the job row every ~1s until it reaches a terminal status (done /
@@ -74,7 +78,7 @@ test('lifecycle: success fixture takes a queued job to done with suggested facts
     .single();
   if (jobError) throw jobError;
 
-  const child = spawnRunner(FIXTURE_SUCCESS);
+  const child = await spawnRunner(FIXTURE_SUCCESS);
   t.after(async () => {
     killChild(child);
     await cleanup(runner, companyId, job.id);
@@ -117,7 +121,7 @@ test('lifecycle: a repeat suggestion (same source URL) is suppressed, job still 
     return count;
   };
 
-  const child = spawnRunner(FIXTURE_REPEAT);
+  const child = await spawnRunner(FIXTURE_REPEAT);
   let lastJobId;
   t.after(async () => {
     killChild(child);
@@ -166,7 +170,7 @@ test('lifecycle: a job stuck running at boot is not wedged (crash recovery)', as
     .single();
   if (jobError) throw jobError;
 
-  const child = spawnRunner(FIXTURE_SUCCESS);
+  const child = await spawnRunner(FIXTURE_SUCCESS);
   t.after(async () => {
     killChild(child);
     await cleanup(runner, companyId, job.id);
@@ -193,7 +197,7 @@ test('lifecycle: a fresh running job is left alone by a concurrently-started ins
     .single();
   if (jobError) throw jobError;
 
-  const child = spawnRunner(FIXTURE_SUCCESS);
+  const child = await spawnRunner(FIXTURE_SUCCESS);
   t.after(async () => {
     killChild(child);
     await cleanup(runner, companyId, job.id);
@@ -241,7 +245,7 @@ test('lifecycle: invalid fixture fails the job with zero writes and restores com
     .single();
   if (jobError) throw jobError;
 
-  const child = spawnRunner(FIXTURE_INVALID);
+  const child = await spawnRunner(FIXTURE_INVALID);
   t.after(async () => {
     killChild(child);
     await cleanup(runner, companyId, job.id);
@@ -283,7 +287,7 @@ test('lifecycle: a well-formed envelope with a sourceless fact fails the schema 
     .single();
   if (jobError) throw jobError;
 
-  const child = spawnRunner(FIXTURE_BAD_SCHEMA);
+  const child = await spawnRunner(FIXTURE_BAD_SCHEMA);
   t.after(async () => {
     killChild(child);
     await cleanup(runner, companyId, job.id);
@@ -326,7 +330,7 @@ test('lifecycle: a company with a hostile domain fails input validation before a
 
   // Success fixture on purpose: if validation is doing its job, no claude
   // binary — real or fake — is ever invoked for this company.
-  const child = spawnRunner(FIXTURE_SUCCESS);
+  const child = await spawnRunner(FIXTURE_SUCCESS);
   t.after(async () => {
     killChild(child);
     await cleanup(runner, companyId, job.id);

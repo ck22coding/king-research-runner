@@ -4,8 +4,10 @@
 // same find-or-create-by-domain shape).
 import { createClient } from '@supabase/supabase-js';
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const ENV_PATH = '/Users/carterking/Projects/dad/.env';
@@ -70,8 +72,46 @@ export async function signInTestUser() {
 // Writes a runner credentials file (same shape/mode index.mjs's saveCreds
 // produces) so a spawned runner can start from a stored session instead of
 // prompting for a pairing code.
-export function writeCredsFor(session, path) {
-  writeFileSync(path, JSON.stringify({ refresh_token: session.refresh_token }), { mode: 0o600 });
+export function writeCredsFor(session, credPath) {
+  writeFileSync(credPath, JSON.stringify({ refresh_token: session.refresh_token }), { mode: 0o600 });
+}
+
+// Service-role client, TEST-ONLY — index.mjs never reads this key. Used to
+// create/delete throwaway users for RLS negative tests (a real second
+// identity is the only way to prove one user's runner can't touch another's
+// jobs) without polluting the shared fixture account. Built lazily (not at
+// module load) so test files that never call these two functions can still
+// import this module without SUPABASE_SERVICE_ROLE_KEY being set.
+let admin;
+function adminClient() {
+  if (!admin) {
+    admin = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false },
+    });
+  }
+  return admin;
+}
+
+export async function adminCreateThrowawayUser() {
+  const email = `runner-test-${randomUUID().slice(0, 8)}@runner-test.example`;
+  const password = randomUUID();
+  const { data, error } = await adminClient().auth.admin.createUser({ email, password, email_confirm: true });
+  if (error) throw error;
+  return { id: data.user.id, email, password };
+}
+
+export async function adminDeleteUser(id) {
+  await adminClient().auth.admin.deleteUser(id);
+}
+
+// Composes writeCredsFor + spawnRunner: writes the given session's refresh
+// token to a fresh tmp creds file, then spawns the real runner already
+// paired against it (no pairing-code prompt needed).
+export function spawnPaired(session, extraEnv = {}) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'kr-'));
+  const credPath = path.join(dir, 'credentials.json');
+  writeCredsFor(session, credPath);
+  return spawnRunner({ env: { KR_CREDENTIALS_PATH: credPath, ...extraEnv } });
 }
 
 // Spawns the real index.mjs as a child process with env merged over the
