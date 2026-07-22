@@ -461,6 +461,13 @@ async function runJob(job) {
   let previousStatus;
   // Fact ids inserted by this job, for compensation if a later write fails.
   let insertedFactIds = [];
+  // Lease state, visible to the catch path: `leaseLost` = another owner has
+  // the row (definite); `leaseUncertain` = repeated heartbeat errors mean we
+  // can't PROVE we still own it — treated as lost for spending, but also
+  // halts this process so the next start's recovery sweep can unwedge the
+  // row (in resident mode nothing else would; codex review).
+  let leaseLost = false;
+  let leaseUncertain = false;
 
   try {
     const { data: company, error: companyError } = await supabase
@@ -527,33 +534,57 @@ async function runJob(job) {
     // Each beat is guarded on (id, running, claimed_by=me): zero rows back
     // means the row is no longer ours (stale-sweep reclaimed it) — kill the
     // child NOW so a run we don't own stops burning real research, and stop
-    // writing. Repeated renewal errors (network down) get the same treatment:
-    // we can't prove we still hold the lease, so we must not keep spending.
+    // writing. Repeated renewal errors (network down) mean we can't prove we
+    // hold the lease — same kill, plus a process halt (see leaseUncertain).
+    // Serialized self-scheduling loop, not setInterval (codex review): each
+    // beat awaits its own DB call before scheduling the next so ticks can't
+    // overlap, and the whole body is try/caught so a rejected promise can't
+    // crash the process out of a timer.
     const killRef = {};
-    let leaseLost = false;
     let beatFailures = 0;
-    const heartbeat = setInterval(async () => {
-      const { data: beat, error: beatError } = await supabase
-        .from('enrichment_jobs')
-        .update({ heartbeat_at: new Date().toISOString() })
-        .eq('id', job.id)
-        .eq('status', 'running')
-        .eq('claimed_by', WORKER_ID)
-        .select('id');
-      if (beatError) {
-        beatFailures += 1;
-        console.error(`job ${job.id}: heartbeat renewal error ${beatFailures}/3: ${beatError.message}`);
-        if (beatFailures < 3) return;
-      } else if (beat && beat.length > 0) {
-        beatFailures = 0;
-        return;
-      }
-      // Lost the lease (or can't prove we hold it) — stop the spend.
-      leaseLost = true;
-      clearInterval(heartbeat);
-      console.error(`job ${job.id}: lease lost — killing claude child and abandoning the job`);
-      killRef.kill?.();
-    }, HEARTBEAT_MS);
+    let heartbeatTimer = null;
+    let heartbeatStopped = false;
+    const stopHeartbeat = () => {
+      heartbeatStopped = true;
+      clearTimeout(heartbeatTimer);
+    };
+    const scheduleBeat = () => {
+      if (heartbeatStopped) return;
+      heartbeatTimer = setTimeout(async () => {
+        try {
+          const { data: beat, error: beatError } = await supabase
+            .from('enrichment_jobs')
+            .update({ heartbeat_at: new Date().toISOString() })
+            .eq('id', job.id)
+            .eq('status', 'running')
+            .eq('claimed_by', WORKER_ID)
+            .select('id');
+          if (beatError) {
+            beatFailures += 1;
+            console.error(`job ${job.id}: heartbeat renewal error ${beatFailures}/3: ${beatError.message}`);
+            if (beatFailures >= 3) leaseUncertain = true;
+          } else if (beat && beat.length > 0) {
+            beatFailures = 0;
+          } else {
+            leaseLost = true;
+          }
+        } catch (beatThrew) {
+          beatFailures += 1;
+          console.error(`job ${job.id}: heartbeat threw ${beatFailures}/3: ${beatThrew.message}`);
+          if (beatFailures >= 3) leaseUncertain = true;
+        }
+        if (leaseLost || leaseUncertain) {
+          stopHeartbeat();
+          console.error(
+            `job ${job.id}: ${leaseLost ? 'lease lost' : 'lease unprovable'} — killing claude child and abandoning the job`
+          );
+          killRef.kill?.();
+          return;
+        }
+        scheduleBeat();
+      }, HEARTBEAT_MS);
+    };
+    scheduleBeat();
 
     console.log(`invoking claude -p for company ${company.id} (${company.name})`);
     let result;
@@ -566,22 +597,23 @@ async function runJob(job) {
       // loop is the upgrade path.
       if (
         !leaseLost &&
+        !leaseUncertain &&
         result.code !== 0 &&
         /API Error: (5\d\d|overloaded)/i.test(result.stdout + result.stderr)
       ) {
         console.error(`job ${job.id}: transient API error, retrying once in 60s`);
         await sleep(60_000);
-        if (!leaseLost) result = await runClaude(prompt, killRef);
+        if (!leaseLost && !leaseUncertain) result = await runClaude(prompt, killRef);
       }
     } finally {
-      clearInterval(heartbeat);
+      stopHeartbeat();
     }
 
-    if (leaseLost) {
+    if (leaseLost || leaseUncertain) {
       // Another owner has (or will re-run) this job — no terminal writes, no
       // company restore, nothing inserted yet (facts insert below). The loud
       // failure still fires so an operator knows this instance lost a lease.
-      throw new LeaseLostError(`job ${job.id}: lease lost mid-run; result discarded`);
+      throw new LeaseLostError(`job ${job.id}: lease ${leaseLost ? 'lost' : 'unprovable'} mid-run; result discarded`);
     }
 
     // Hard gate: must run to completion, and pass, before any facts/sources/
@@ -716,8 +748,19 @@ async function runJob(job) {
 
     // Lease lost: the job/company belong to another owner now — recording a
     // failure or restoring the company would fight their writes. The banner
-    // above already made the loss loud; stop here.
-    if (leaseWasLost) return;
+    // above already made the loss loud. If the loss was merely UNPROVABLE
+    // (heartbeat errors, not a zero-row ownership check), the job may in
+    // fact still be ours and sitting 'running' — halt the process so the
+    // next start's recovery sweep unwedges it; in resident mode nothing
+    // else ever would (codex review).
+    if (leaseWasLost) {
+      if (leaseUncertain && !leaseLost) {
+        console.error(`job ${job.id}: lease unprovable — halting so restart recovery can unwedge the row`);
+        process.exitCode = 1;
+        return 'halt';
+      }
+      return;
+    }
 
     // The failure-path writes themselves must be checked: supabase-js
     // returns {error}, it doesn't throw. If we can't record the failure,
@@ -736,12 +779,17 @@ async function runJob(job) {
     }
     // Owner-guarded like the success commit — if the lease was swept while
     // we were failing, the new owner's state wins and 0 rows come back
-    // (fine: their run supersedes this failure record).
-    const { error: failWriteError } = await supabase
+    // (fine: their run supersedes this failure record, but say so in the
+    // log rather than silently, codex review).
+    const { data: failRows, error: failWriteError } = await supabase
       .from('enrichment_jobs')
       .update({ status: 'failed', error: err.message, finished_at: new Date().toISOString() })
       .eq('id', job.id)
-      .eq('claimed_by', WORKER_ID);
+      .eq('claimed_by', WORKER_ID)
+      .select('id');
+    if (!failWriteError && (!failRows || failRows.length === 0)) {
+      console.error(`job ${job.id}: failure record skipped — lease no longer ours, the new owner's state wins`);
+    }
     if (failWriteError || restoreError) {
       console.error(
         `FATAL: failure-path write failed (job: ${failWriteError?.message ?? 'ok'}, company: ${restoreError?.message ?? 'ok'}) — halting this worker; boot crash-recovery resets the job on next restart`
