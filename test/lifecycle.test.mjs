@@ -59,7 +59,7 @@ async function pollUntilTerminal(runner, jobId) {
 // cleanup is safe and mirrors enrich-e2e.spec.ts's afterAll. Also parks any
 // job this run left non-terminal so a later real runner never claims it.
 async function cleanup(runner, companyId, jobId) {
-  await runner.from('facts').update({ status: 'rejected' }).eq('company_id', companyId);
+  await runner.from('facts').update({ status: 'removed' }).eq('company_id', companyId);
   await runner
     .from('enrichment_jobs')
     .update({ status: 'failed', error: 'test cleanup: lifecycle harness run', finished_at: new Date().toISOString() })
@@ -91,9 +91,9 @@ test('lifecycle: success fixture takes a queued job to done with suggested facts
     .from('facts')
     .select('id, status, sources(id)')
     .eq('company_id', companyId)
-    .eq('status', 'suggested');
+    .eq('status', 'included');
   if (factsError) throw factsError;
-  assert.ok(facts.length >= 1, 'expected at least one suggested fact inserted');
+  assert.ok(facts.length >= 1, 'expected at least one included fact inserted');
   for (const fact of facts) {
     assert.ok(fact.sources.length >= 1, `expected fact ${fact.id} to have at least one source`);
   }
@@ -184,9 +184,9 @@ test('lifecycle: a fresh running job is left alone by a concurrently-started ins
   const { runner, userId } = await signInRunner();
   const companyId = await findOrCreateRunnerTestCo(runner, userId);
 
-  // Simulates a second instance starting while a first is genuinely mid-job
-  // (e.g. a manual run overlapping a launchd tick): started_at is fresh
-  // (now), well inside the staleness window. Boot crash-recovery on this new
+  // Simulates a second instance starting while a first is genuinely mid-job:
+  // started_at is fresh (now), well inside the staleness window. Boot
+  // crash-recovery on this new
   // instance must NOT reset it — a reset here would yank an in-flight job
   // back to 'queued', where it could be re-claimed and re-run: real, paid
   // research executed twice.

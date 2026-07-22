@@ -10,14 +10,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
 
-// Same plugin tree test-run.sh drives — see that script for the exact
-// claude -p contract this runner replicates.
-const PLUGIN_DIR = '/Users/carterking/Projects/dad/company-preview/skill/plugins/company-preview';
-const SCHEMA_PATH = path.join(PLUGIN_DIR, 'references', 'output-schema.json');
-
 // Optional env file: dev/tests point KR_ENV_FILE at the project .env;
 // npx users have neither and that's fine — defaults below cover them.
 try { process.loadEnvFile(process.env.KR_ENV_FILE ?? '.env'); } catch {}
+
+// Same plugin tree test-run.sh drives — see that script for the exact
+// claude -p contract this runner replicates. Only set in dev (--plugin-dir
+// is passed to claude only when this is set; unset means the plugin is
+// installed via the marketplace instead, see runClaude below).
+const PLUGIN_DIR = process.env.PLUGIN_DIR || null;
+const SCHEMA_PATH = PLUGIN_DIR ? path.join(PLUGIN_DIR, 'references', 'output-schema.json') : null;
 
 // URL + anon key get baked public defaults (they are public by design; RLS
 // is the security boundary) so npx users with no env file still work.
@@ -41,15 +43,10 @@ const RUNNER_MODEL = process.env.RUNNER_MODEL || '';
 // Clamped to [1, 8]: negative/NaN/fractional env values fall back sanely and
 // a fat-fingered large value can't stampede the DB or the claude CLI.
 const CONCURRENCY = Math.min(8, Math.max(1, Math.trunc(Number(process.env.RUNNER_CONCURRENCY)) || 2));
-// On-demand mode: drain whatever is queued right now, then exit — no resident
-// daemon. A launchd LaunchAgent (see launchd/) fires this on an interval
-// instead of a `while(true)` process staying up. `--once` is accepted as a
-// CLI flag too so it's easy to try by hand alongside the env var.
-const RUNNER_ONCE = process.env.RUNNER_ONCE === '1' || process.argv.includes('--once');
-// Queue namespace (migration §F): launchd runs 'prod'; tests set
+// Queue namespace (migration §F): each user's runner runs 'prod'; tests set
 // RUNNER_QUEUE=test-<pid>-<ts>. Every recovery/poll/claim query filters on
 // this — the boundary that keeps a test run from triggering REAL paid
-// research and the prod runner from claiming test fixtures.
+// research and a real runner from claiming test fixtures.
 const RUNNER_QUEUE = process.env.RUNNER_QUEUE || 'prod';
 // Lease identity + cadence (migration §E). One id per process is enough:
 // in-process workers never contest a row after the atomic claim; the lease
@@ -69,8 +66,7 @@ try {
 } catch (err) {
   console.error(
     'FATAL: could not resolve the claude binary. Set CLAUDE_BIN to its absolute path. ' +
-      'Daemon/background contexts (e.g. this runner started from a launchd job or another ' +
-      "non-interactive parent) don't inherit your interactive shell's PATH, so " +
+      "Non-interactive parents don't inherit your interactive shell's PATH, so " +
       `\`command -v claude\` can fail here even though \`claude\` works fine in your terminal. (${err.message})`
   );
   process.exit(1);
@@ -126,6 +122,14 @@ console.log(`runner started: queue '${RUNNER_QUEUE}' as ${ME.email}, claude at $
 
 let schemaText;
 let schema;
+if (!SCHEMA_PATH) {
+  // ponytail: the research schema currently only ships inside the plugin
+  // checkout (PLUGIN_DIR), not the npm-packaged runner itself — set
+  // PLUGIN_DIR in dev. Bundling the schema into the runner package so a
+  // marketplace-only install works too is the upgrade path (Task 8/9).
+  console.error('FATAL: PLUGIN_DIR is not set — cannot locate the research output schema.');
+  process.exit(1);
+}
 try {
   schemaText = readFileSync(SCHEMA_PATH, 'utf8');
   schema = JSON.parse(schemaText);
@@ -591,24 +595,26 @@ if (recoverError) {
 // longer own must stop burning real research immediately.
 function runClaude(prompt, killRef) {
   return new Promise((resolve) => {
+    const args = [
+      '-p',
+      prompt,
+      '--output-format',
+      'json',
+      '--tools',
+      'WebSearch,WebFetch',
+      '--permission-mode',
+      'dontAsk',
+      ...(RUNNER_MODEL ? ['--model', RUNNER_MODEL] : []),
+      '--json-schema',
+      schemaText,
+    ];
+    // --plugin-dir + matching cwd only in dev (PLUGIN_DIR set); a marketplace
+    // install needs neither — claude finds the installed plugin itself.
+    if (PLUGIN_DIR) args.splice(2, 0, '--plugin-dir', PLUGIN_DIR);
     const child = spawn(
       CLAUDE_BIN,
-      [
-        '-p',
-        prompt,
-        '--plugin-dir',
-        PLUGIN_DIR,
-        '--output-format',
-        'json',
-        '--tools',
-        'WebSearch,WebFetch',
-        '--permission-mode',
-        'dontAsk',
-        ...(RUNNER_MODEL ? ['--model', RUNNER_MODEL] : []),
-        '--json-schema',
-        schemaText,
-      ],
-      { cwd: PLUGIN_DIR }
+      args,
+      PLUGIN_DIR ? { cwd: PLUGIN_DIR } : {}
     );
     let stdout = '';
     let stderr = '';
@@ -689,15 +695,9 @@ async function worker() {
 
     const job = (queued ?? []).find((j) => !activeCompanies.has(j.company_id));
     if (!job) {
-      // Once-mode: nothing claimable right now (queue empty, or every queued
-      // row belongs to a company a sibling worker is already mid-job on).
-      // Return instead of sleeping — a sibling still holding a company lock
-      // keeps looping and will pick up any job behind it once it frees that
-      // lock, so no job is stranded (see README "How it runs jobs").
-      if (RUNNER_ONCE) {
-        console.log('once-mode: no claimable job, worker exiting');
-        return;
-      }
+      // Nothing claimable right now (queue empty, or every queued row
+      // belongs to a company a sibling worker is already mid-job on) — sleep
+      // and poll again.
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
@@ -1145,9 +1145,9 @@ const heartbeatTimer = setInterval(beatOnce, POLL_INTERVAL_MS);
 heartbeatTimer.unref();
 
 await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-// Once-mode only reaches here: every worker drained the queue and returned.
-// No explicit process.exit() needed — nothing left keeps the event loop
-// alive (the Supabase auth client's refresh timer is unref'd), so the
-// process exits on its own with whatever process.exitCode was set (0
-// unless a worker halted above).
-if (RUNNER_ONCE) console.log('once-mode: queue drained, exiting');
+// Workers loop forever; this only resolves once every worker halts after a
+// failure path that couldn't even record a failure (shuttingDown, above). No
+// explicit process.exit() needed — nothing left keeps the event loop alive
+// (the Supabase auth client's refresh timer and the heartbeat timer are both
+// unref'd), so the process exits on its own with whatever process.exitCode
+// was set (1 in that case).

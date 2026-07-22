@@ -55,7 +55,7 @@ async function pollUntilTerminal(runner, jobId) {
 // ponytail: same blanket-reject-facts + park-non-terminal-job cleanup as
 // lifecycle.test.mjs — Runner Test Co exists solely for these tests.
 async function cleanup(runner, companyId, jobId) {
-  await runner.from('facts').update({ status: 'rejected' }).eq('company_id', companyId);
+  await runner.from('facts').update({ status: 'removed' }).eq('company_id', companyId);
   await runner
     .from('enrichment_jobs')
     .update({ status: 'failed', error: 'test cleanup: timeout harness run', finished_at: new Date().toISOString() })
