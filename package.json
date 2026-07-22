@@ -1,7 +1,12 @@
 {
-  "name": "runner",
+  "name": "king-research-runner",
+  "version": "0.1.0",
+  "description": "Local research runner for King Research CRM — your computer is the backend.",
   "type": "module",
-  "private": true,
+  "bin": { "king-research-runner": "./index.mjs" },
+  "files": ["index.mjs", "README.md"],
+  "engines": { "node": ">=20.12" },
+  "license": "MIT",
   "scripts": {
     "test": "node --test --test-concurrency=1 test/startup.test.mjs test/lifecycle.test.mjs test/timeout.test.mjs test/pairing.test.mjs test/per-user.test.mjs"
   },
