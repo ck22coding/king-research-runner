@@ -63,8 +63,18 @@ export async function findOrCreateCompany(runner, userId, name, domain) {
   return created.id;
 }
 
-export function findOrCreateRunnerTestCo(runner, userId) {
-  return findOrCreateCompany(runner, userId, COMPANY_NAME, COMPANY_DOMAIN);
+export async function findOrCreateRunnerTestCo(runner, userId) {
+  const id = await findOrCreateCompany(runner, userId, COMPANY_NAME, COMPANY_DOMAIN);
+  // Self-clean: a crashed/killed prior run can strand an active job here, and
+  // the one-active-per-company unique index then rejects every new test job.
+  // Sweep stale actives before handing the fixture out (same pattern as web's
+  // realtime-smoke self-reset).
+  await runner
+    .from('enrichment_jobs')
+    .update({ status: 'failed', error: 'test fixture sweep: stale active job', finished_at: new Date().toISOString() })
+    .eq('company_id', id)
+    .in('status', ['queued', 'running']);
+  return id;
 }
 
 // Password sign-in against the fixture account (test-only — production

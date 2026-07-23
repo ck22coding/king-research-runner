@@ -4,7 +4,7 @@
 // suggested facts/sources back to the DB.
 import { execSync, spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -88,8 +88,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const CRED_PATH = process.env.KR_CREDENTIALS_PATH || path.join(os.homedir(), '.king-research', 'credentials.json');
 
 function saveCreds(session) {
-  mkdirSync(path.dirname(CRED_PATH), { recursive: true });
+  // mode/chmod both: writeFileSync's mode only applies on create, so an
+  // existing file with loose permissions must be tightened explicitly.
+  mkdirSync(path.dirname(CRED_PATH), { recursive: true, mode: 0o700 });
   writeFileSync(CRED_PATH, JSON.stringify({ refresh_token: session.refresh_token }), { mode: 0o600 });
+  chmodSync(CRED_PATH, 0o600);
 }
 
 async function ensureSession() {
@@ -125,6 +128,13 @@ async function ensureSession() {
 
 const ME = await ensureSession();
 console.log(`signed in as ${ME.email}`);
+
+// Supabase rotates refresh tokens in the background during long resident
+// runs; persist every rotation or the stored token goes stale and the next
+// start forces a needless re-pair.
+supabase.auth.onAuthStateChange((_event, session) => {
+  if (session?.refresh_token) saveCreds(session);
+});
 
 console.log(`runner started: queue '${RUNNER_QUEUE}' as ${ME.email}, claude at ${CLAUDE_BIN}, worker ${WORKER_ID}`);
 
