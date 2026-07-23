@@ -209,6 +209,54 @@ test('fan-out: every node is spawned with its own model and fetch budget', async
   assert.equal(spawned.size, 7, 'expected exactly the scout plus six topic nodes — no extra research calls');
 });
 
+// The tldr node is the one call that runs with NO plugin loaded, so SKILL.md's
+// "no preamble, no summary, no 'here's what I found'" rule is absent. With the
+// bundled description ("2-3 sentence summary per tldr-contract.md") the model
+// reads "summary" as "summary of the work I just did" and writes
+// "Wrote a 3-sentence TL;DR following the contract..." straight into
+// companies.tldr — user-visible on the brief and the PDF. Caught on a live
+// Medtronic run; an A/B there showed prompt wording alone does NOT fix it (the
+// field description outranks the prompt body), so the override is the fix and
+// this asserts it actually reaches the argv.
+test('tldr node: its schema demands the prose itself, not a report about it', async (t) => {
+  const { runner, userId } = await signInRunner();
+  const companyId = await findOrCreateRunnerTestCo(runner, userId);
+  const schemaFile = path.join(mkdtempSync(path.join(tmpdir(), 'kr-tldr-')), 'schema.json');
+
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  const session = await signInTestUser();
+  const child = spawnPaired(session, {
+    CLAUDE_BIN: FIXTURE_RECORD,
+    POLL_INTERVAL_MS: String(POLL_INTERVAL_MS),
+    KR_TLDR_SCHEMA_FILE: schemaFile,
+  });
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  const finalJob = await pollUntilTerminal(runner, job.id);
+  assert.equal(finalJob.status, 'done', `expected the tldr-schema run to finish, got '${finalJob.status}' (error=${finalJob.error})`);
+
+  const description = JSON.parse(readFileSync(schemaFile, 'utf8')).properties.tldr.description;
+  assert.match(
+    description,
+    /never a report of what you did/i,
+    'the tldr node must override the bundled schema description — without it the model returns a report about the summary instead of the summary'
+  );
+  assert.doesNotMatch(
+    description,
+    /^2-3 sentence summary per tldr-contract\.md\.$/,
+    'the tldr node is still passing the bundled full-run description, which regresses the meta-commentary bug'
+  );
+});
+
 // Failure containment (spec §10): before the topic graph, one section
 // stumbling failed the whole schema-gated array and lost all six. Now a dead
 // topic node costs exactly that topic — the job completes as a partial and

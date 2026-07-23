@@ -236,11 +236,27 @@ const VERIFY_SCHEMA_TEXT = JSON.stringify({
     downgrade: { type: 'boolean' },
   },
 });
+// The bundled description ("2-3 sentence summary per tldr-contract.md") is
+// written for the full run, where SKILL.md is loaded and supplies "no
+// preamble, no summary, no 'here's what I found'". This is a bare call with
+// no plugin, so that correction is absent and the model reads "summary" as
+// "summary of the work I just did" — it returns "Wrote a 3-sentence TL;DR
+// following the contract..." instead of the TL;DR. Verified on a real
+// Medtronic run: prompt wording alone does NOT fix it (the field description
+// outranks the prompt body); overriding the description here does.
 const TLDR_SCHEMA_TEXT = JSON.stringify({
   type: 'object',
   additionalProperties: false,
   required: ['tldr'],
-  properties: { tldr: schema.properties.tldr },
+  properties: {
+    tldr: {
+      ...schema.properties.tldr,
+      description:
+        'The finished TL;DR prose itself, exactly as it will be printed in the brief ' +
+        '(e.g. "Provider of cardiac devices for hospitals. Revenue grew 9% ..."). ' +
+        'Never a description of the summary, never a report of what you did.',
+    },
+  },
 });
 
 // Scout output is model-written text derived from web pages, and it gets
