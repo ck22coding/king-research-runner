@@ -32,9 +32,11 @@ test('merge: same group_key across two sections collapses to one fact', () => {
 
 // The edge the spec calls out: independently-run sections slug the same story
 // differently, so group_key alone misses it and URL overlap has to catch it.
-test('merge: different group_keys but an overlapping source URL still collapse', () => {
+// This is the common shape — one side has no group_key ("nothing else to group
+// it with", per SKILL.md step 7).
+test('merge: an overlapping source URL collapses facts when neither names a rival story', () => {
   const { facts } = mergeTopicFacts([
-    node('news', [fact({ group_key: 'acme-raise', sources: [src('https://tc.example/story')] })]),
+    node('news', [fact({ group_key: null, sources: [src('https://tc.example/story')] })]),
     node('financials', [
       fact({
         section: 'financials',
@@ -45,6 +47,29 @@ test('merge: different group_keys but an overlapping source URL still collapse',
   ]);
   assert.equal(facts.length, 1, 'URL overlap must catch what group_key missed');
   assert.equal(facts[0].sources.length, 2, 'the shared URL is not duplicated');
+  assert.equal(facts[0].group_key, 'acme-series-c', 'the non-null group_key fills in the null one');
+});
+
+// The guard (Carter, 2026-07-23). Two sections citing one document for two
+// DIFFERENT claims — an annual report supporting both a financials and a risk
+// flag — must not collapse, or the second claim is silently lost. Each side
+// named its own story, so believe them.
+test('merge: a shared URL does NOT merge facts that named different stories', () => {
+  const annualReport = src('https://acme.example/2026-annual-report');
+  const { facts } = mergeTopicFacts([
+    node('financials', [
+      fact({ section: 'financials', group_key: 'acme-fy26-revenue', text: 'Revenue grew 12%.', sources: [annualReport, src('https://a.example/1')] }),
+    ]),
+    node('risk_flags', [
+      fact({ section: 'risk_flags', group_key: 'acme-supplier-concentration', text: 'One supplier accounts for 40% of components.', sources: [annualReport, src('https://b.example/2')] }),
+    ]),
+  ]);
+  assert.equal(facts.length, 2, 'two distinct claims citing one document must both survive');
+  assert.deepEqual(
+    facts.map((f) => f.section).sort(),
+    ['financials', 'risk_flags'],
+    'neither section is swallowed by the other'
+  );
 });
 
 // Grouping has to be transitive (codex review): the third fact is the only
@@ -53,7 +78,8 @@ test('merge: different group_keys but an overlapping source URL still collapse',
 test('merge: a fact bridging two existing groups collapses all three', () => {
   const { facts } = mergeTopicFacts([
     node('news', [fact({ group_key: 'k1', sources: [src('https://a.example/1')] })]),
-    node('financials', [fact({ section: 'financials', group_key: 'k2', sources: [src('https://b.example/2')] })]),
+    // No group_key, so the URL guard lets it join something later.
+    node('financials', [fact({ section: 'financials', group_key: null, sources: [src('https://b.example/2')] })]),
     // Carries k1 (matches the first) AND b.example/2 (matches the second).
     node('risk_flags', [
       fact({ section: 'risk_flags', group_key: 'k1', importance: 9, sources: [src('https://b.example/2'), src('https://c.example/3')] }),
