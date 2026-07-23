@@ -17,6 +17,7 @@ const FIXTURE_SUCCESS = path.join(__dirname, 'fixtures', 'fake-claude-success.mj
 const FIXTURE_INVALID = path.join(__dirname, 'fixtures', 'fake-claude-invalid.mjs');
 const FIXTURE_BAD_SCHEMA = path.join(__dirname, 'fixtures', 'fake-claude-bad-schema.mjs');
 const FIXTURE_REPEAT = path.join(__dirname, 'fixtures', 'fake-claude-repeat.mjs');
+const FIXTURE_PARTIAL = path.join(__dirname, 'fixtures', 'fake-claude-partial.mjs');
 
 const POLL_INTERVAL_MS = 1000;
 const POLL_TIMEOUT_MS = 30000;
@@ -148,6 +149,50 @@ test('lifecycle: a repeat suggestion (same source URL) is suppressed, job still 
   assert.equal(job2.status, 'done', `expected second repeat-fixture job done, got '${job2.status}' (error=${job2.error})`);
   const afterSecond = await countRepeatSources();
   assert.equal(afterSecond, afterFirst, 'expected zero new source rows for an already-suggested URL');
+});
+
+// Failure containment (spec §10): before the topic graph, one section
+// stumbling failed the whole schema-gated array and lost all six. Now a dead
+// topic node costs exactly that topic — the job completes as a partial and
+// names what was lost, loudly, in the job row.
+test('lifecycle: one dead topic node yields a partial report, not a failed job', async (t) => {
+  const { runner, userId } = await signInRunner();
+  const companyId = await findOrCreateRunnerTestCo(runner, userId);
+
+  const { count: preFactCount, error: preFactCountError } = await runner
+    .from('facts')
+    .select('id', { count: 'exact', head: true })
+    .eq('company_id', companyId);
+  if (preFactCountError) throw preFactCountError;
+
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  const child = await spawnRunner(FIXTURE_PARTIAL);
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  const finalJob = await pollUntilTerminal(runner, job.id);
+  assert.equal(finalJob.status, 'done', `expected a partial run to still finish done, got '${finalJob.status}' (error=${finalJob.error})`);
+  assert.match(finalJob.error ?? '', /partial: financials/, `expected the job to record which section was lost, got: ${finalJob.error}`);
+
+  // The surviving sections' work is the whole point — it must be written.
+  const { count: postFactCount, error: postFactCountError } = await runner
+    .from('facts')
+    .select('id', { count: 'exact', head: true })
+    .eq('company_id', companyId);
+  if (postFactCountError) throw postFactCountError;
+  assert.ok(postFactCount > preFactCount, 'expected the surviving sections to still write their facts');
+
+  const { data: company, error: companyError } = await runner.from('companies').select('status').eq('id', companyId).single();
+  if (companyError) throw companyError;
+  assert.equal(company.status, 'ready', 'expected a partial run to still mark the company ready');
 });
 
 test('lifecycle: a job stuck running at boot is not wedged (crash recovery)', async (t) => {
