@@ -1034,6 +1034,38 @@ const activeCompanies = new Set();
 // boot crash-recovery for the stuck job.
 let shuttingDown = false;
 
+// A poll error is retried because most are transient DB blips. A DEAD AUTH
+// SESSION is not transient: ensureSession() runs once at startup and nothing
+// ever re-runs it, so one failed background token refresh downgrades
+// this client to the `anon` role for the life of the process. Every policy on
+// enrichment_jobs is scoped `to authenticated`, so anon has no table grant and
+// Postgres raises a hard 42501 ("permission denied for table enrichment_jobs")
+// on every poll, forever — the runner logs busily while doing nothing and the
+// UI shows jobs Queued with no failure surfaced (loud-failures rule).
+//
+// So cap consecutive failures and drain-and-exit. Exiting is the unwedge: boot
+// crash-recovery resets running→queued on the next start, and the stale
+// runner_heartbeats row flips the web "runner offline" banner, which is what
+// actually tells the user something is wrong.
+//
+// Process-wide, not per-worker: all workers share one supabase client, so a
+// live session is a process-wide property and a sibling's successful poll
+// genuinely clears the count.
+//
+// A COUNT, not "failing for N minutes" — these runners live on laptops that
+// sleep. Sleeping produces no polls, so a count can't accumulate while closed;
+// wall-clock keeps advancing, so a time-based grace period would read one
+// pre-sleep failure plus the first post-wake one as hours of outage and quit
+// on the spot. 20 is deliberately loose: at the defaults (2 workers, 5s poll)
+// it rides out ~50s of continuous failure, enough for a wifi drop or a
+// wake-from-sleep before the network is back. A dead session never recovers,
+// so waiting is free; exiting on a blip is not — nothing restarts this process.
+// ponytail: no re-auth attempt in the loop — exit-and-restart reuses recovery
+// that already exists; add ensureSession() here only if a supervisor ever
+// thrashes on restart.
+const MAX_CONSECUTIVE_POLL_ERRORS = 20;
+let consecutivePollErrors = 0;
+
 async function worker() {
   while (!shuttingDown) {
     // ponytail: 10-row scan window — enough to skip past a locked company's
@@ -1048,12 +1080,25 @@ async function worker() {
       .order('created_at')
       .limit(10);
     // Transient DB errors while polling must not crash the runner — log,
-    // sleep, retry (codex review).
+    // sleep, retry (codex review). Unless they stop looking transient: see
+    // MAX_CONSECUTIVE_POLL_ERRORS above.
     if (queuedError) {
+      consecutivePollErrors += 1;
+      if (consecutivePollErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
+        console.error(
+          `FATAL: ${consecutivePollErrors} consecutive poll errors, last: ${queuedError.message} — ` +
+            'halting. If this says "permission denied", the login died: restart the runner, ' +
+            're-pair it (Onboarding → Connect this computer) if that alone does not fix it.'
+        );
+        process.exitCode = 1;
+        shuttingDown = true;
+        return;
+      }
       console.error(`poll error (will retry): ${queuedError.message}`);
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
+    consecutivePollErrors = 0;
 
     const job = (queued ?? []).find((j) => !activeCompanies.has(j.company_id));
     if (!job) {
