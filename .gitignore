@@ -1,2 +1,5 @@
 node_modules/
 runner.log
+
+# Claude Code local worktrees / tooling (never committed)
+.claude/

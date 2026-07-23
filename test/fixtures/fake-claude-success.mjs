@@ -12,6 +12,8 @@ const structuredOutput = {
       section: 'news',
       text: 'Runner Test Co was created as a fixture for the runner lifecycle tests.',
       fact_date: '2026-07-15',
+      importance: 5,
+      stats: null,
       group_key: null,
       importance: 5,
       stats: null,
