@@ -1,5 +1,15 @@
 node_modules/
-runner.log
+
+# logs (may contain job UUIDs, emails, local paths)
+*.log
+
+# secrets / credentials — the runner writes its session to
+# ~/.king-research/credentials.json (outside the repo), but guard anyway
+.env*
+credentials.json
+*.key
+*.pem
+.king-research/
 
 # Claude Code local worktrees / tooling (never committed)
 .claude/
