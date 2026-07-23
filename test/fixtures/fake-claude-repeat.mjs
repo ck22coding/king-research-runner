@@ -10,6 +10,8 @@ const structuredOutput = {
       section: 'news',
       text: 'Runner Test Co repeat-fixture story (same URL every run).',
       fact_date: '2026-07-15',
+      importance: 5,
+      stats: null,
       group_key: null,
       sources: [
         {
