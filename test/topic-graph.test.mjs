@@ -47,6 +47,24 @@ test('merge: different group_keys but an overlapping source URL still collapse',
   assert.equal(facts[0].sources.length, 2, 'the shared URL is not duplicated');
 });
 
+// Grouping has to be transitive (codex review): the third fact is the only
+// thing connecting the first two, and picking a single match would leave the
+// story split across two facts — the exact duplicate this edge removes.
+test('merge: a fact bridging two existing groups collapses all three', () => {
+  const { facts } = mergeTopicFacts([
+    node('news', [fact({ group_key: 'k1', sources: [src('https://a.example/1')] })]),
+    node('financials', [fact({ section: 'financials', group_key: 'k2', sources: [src('https://b.example/2')] })]),
+    // Carries k1 (matches the first) AND b.example/2 (matches the second).
+    node('risk_flags', [
+      fact({ section: 'risk_flags', group_key: 'k1', importance: 9, sources: [src('https://b.example/2'), src('https://c.example/3')] }),
+    ]),
+  ]);
+  assert.equal(facts.length, 1, 'the bridging fact must collapse both groups, not just one');
+  assert.equal(facts[0].sources.length, 3, 'every distinct source survives the fold');
+  assert.equal(facts[0].importance, 9, 'max importance survives across a transitive fold');
+  assert.equal(facts[0].section, 'news', 'the earliest-seen fact still owns the text/section');
+});
+
 test('merge: distinct stories are left alone', () => {
   const { facts, mergedCount } = mergeTopicFacts([
     node('news', [fact({ group_key: 'acme-launch', sources: [src('https://a.example/1')] })]),
