@@ -291,8 +291,8 @@ async function fetchInWindowFacts(companyId, { reviewedOnly = false } = {}) {
   return bySection;
 }
 
-async function runRankingPass(companyId) {
-  const bySection = await fetchInWindowFacts(companyId);
+async function runRankingPass(companyId, { reviewedOnly = false } = {}) {
+  const bySection = await fetchInWindowFacts(companyId, { reviewedOnly });
   for (const [section, list] of bySection) {
     if (list.length < 2) bySection.delete(section); // nothing to rank
   }
@@ -758,7 +758,9 @@ async function runJob(job) {
   // the 5-min stale sweep; add the enrich-style beat if generates run long.
   if (job.kind === 'generate') {
     try {
-      await runRankingPass(job.company_id);
+      // reviewedOnly here too — a hand-inserted generate job must not feed
+      // unreviewed facts to Sonnet or reorder their importance (codex).
+      await runRankingPass(job.company_id, { reviewedOnly: true });
       await runSynthesisPass(job.company_id);
       const { data: doneRows, error: doneError } = await supabase
         .from('enrichment_jobs')
@@ -1167,7 +1169,7 @@ if (resynthIdx !== -1) {
     process.exit(1);
   }
   console.log(`resynth mode: ranking + synthesis for company ${companyId}`);
-  await runRankingPass(companyId);
+  await runRankingPass(companyId, { reviewedOnly: true });
   await runSynthesisPass(companyId);
   process.exit(0);
 }
