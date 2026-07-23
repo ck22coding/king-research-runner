@@ -9,6 +9,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { signInRunner, signInTestUser, spawnPaired, findOrCreateRunnerTestCo, findOrCreateCompany } from './helpers.mjs';
 
@@ -18,6 +20,7 @@ const FIXTURE_INVALID = path.join(__dirname, 'fixtures', 'fake-claude-invalid.mj
 const FIXTURE_BAD_SCHEMA = path.join(__dirname, 'fixtures', 'fake-claude-bad-schema.mjs');
 const FIXTURE_REPEAT = path.join(__dirname, 'fixtures', 'fake-claude-repeat.mjs');
 const FIXTURE_PARTIAL = path.join(__dirname, 'fixtures', 'fake-claude-partial.mjs');
+const FIXTURE_RECORD = path.join(__dirname, 'fixtures', 'fake-claude-record.mjs');
 
 const POLL_INTERVAL_MS = 1000;
 const POLL_TIMEOUT_MS = 30000;
@@ -149,6 +152,61 @@ test('lifecycle: a repeat suggestion (same source URL) is suppressed, job still 
   assert.equal(job2.status, 'done', `expected second repeat-fixture job done, got '${job2.status}' (error=${job2.error})`);
   const afterSecond = await countRepeatSources();
   assert.equal(afterSecond, afterFirst, 'expected zero new source rows for an already-suggested URL');
+});
+
+// The money table (spec §6) is the whole point of the fan-out — per-topic
+// models and fetch caps are what bound the cost. A table nobody checks is a
+// comment, so this asserts what actually reached the `claude -p` argv.
+test('fan-out: every node is spawned with its own model and fetch budget', async (t) => {
+  const { runner, userId } = await signInRunner();
+  const companyId = await findOrCreateRunnerTestCo(runner, userId);
+  const recordFile = path.join(mkdtempSync(path.join(tmpdir(), 'kr-rec-')), 'nodes.tsv');
+
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  const session = await signInTestUser();
+  const child = spawnPaired(session, {
+    CLAUDE_BIN: FIXTURE_RECORD,
+    POLL_INTERVAL_MS: String(POLL_INTERVAL_MS),
+    KR_RECORD_FILE: recordFile,
+  });
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  const finalJob = await pollUntilTerminal(runner, job.id);
+  assert.equal(finalJob.status, 'done', `expected the recording run to finish, got '${finalJob.status}' (error=${finalJob.error})`);
+
+  const spawned = new Map(
+    readFileSync(recordFile, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        const [kind, model, budget] = line.split('\t');
+        return [kind, { model, budget }];
+      })
+  );
+
+  // Straight from the spec's §6 table.
+  const EXPECTED = {
+    scout: { model: 'haiku', budget: '2' },
+    'topic:leadership': { model: 'haiku', budget: '4' },
+    'topic:news': { model: 'haiku', budget: '6' },
+    'topic:growth_signals': { model: 'haiku', budget: '4' },
+    'topic:acquisitions_partnerships': { model: 'sonnet', budget: '6' },
+    'topic:financials': { model: 'sonnet', budget: '8' },
+    'topic:risk_flags': { model: 'sonnet', budget: '5' },
+  };
+  for (const [node, want] of Object.entries(EXPECTED)) {
+    assert.deepEqual(spawned.get(node), want, `node '${node}' was not spawned per the spec's model/fetch-cap table`);
+  }
+  assert.equal(spawned.size, 7, 'expected exactly the scout plus six topic nodes — no extra research calls');
 });
 
 // Failure containment (spec §10): before the topic graph, one section

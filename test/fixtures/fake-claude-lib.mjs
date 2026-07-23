@@ -23,7 +23,6 @@ export function nodeKind(prompt) {
   if (/^You are fact-checking ONE research claim/m.test(prompt)) return 'verify';
   if (/^Write the TL;DR/m.test(prompt)) return 'tldr';
   if (/^You are ranking research facts/m.test(prompt)) return 'rank';
-  if (/^You are writing the sections/m.test(prompt)) return 'synthesis';
   return 'unknown';
 }
 
