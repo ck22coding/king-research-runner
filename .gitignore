@@ -1,3 +1,6 @@
 node_modules/
 runner.log
 launchd/*.log
+
+# Claude Code local worktrees / tooling (never committed)
+.claude/
