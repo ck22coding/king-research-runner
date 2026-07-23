@@ -122,14 +122,6 @@ console.log(`runner started: queue '${RUNNER_QUEUE}' as ${ME.email}, claude at $
 
 let schemaText;
 let schema;
-if (!SCHEMA_PATH) {
-  // ponytail: the research schema currently only ships inside the plugin
-  // checkout (PLUGIN_DIR), not the npm-packaged runner itself — set
-  // PLUGIN_DIR in dev. Bundling the schema into the runner package so a
-  // marketplace-only install works too is the upgrade path (Task 8/9).
-  console.error('FATAL: PLUGIN_DIR is not set — cannot locate the research output schema.');
-  process.exit(1);
-}
 try {
   schemaText = readFileSync(SCHEMA_PATH, 'utf8');
   schema = JSON.parse(schemaText);

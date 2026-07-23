@@ -185,14 +185,24 @@ test('lifecycle: a fresh running job is left alone by a concurrently-started ins
   const companyId = await findOrCreateRunnerTestCo(runner, userId);
 
   // Simulates a second instance starting while a first is genuinely mid-job:
-  // started_at is fresh (now), well inside the staleness window. Boot
-  // crash-recovery on this new
-  // instance must NOT reset it — a reset here would yank an in-flight job
-  // back to 'queued', where it could be re-claimed and re-run: real, paid
-  // research executed twice.
+  // started_at AND heartbeat_at are both fresh (now) — a real in-flight claim
+  // always stamps heartbeat_at too (see runJob's claim update), so a fixture
+  // that leaves it null isn't a faithful simulation: boot recovery treats
+  // heartbeat_at IS NULL as "definitely dead" regardless of started_at (see
+  // its comment in index.mjs) and would sweep it right back to 'queued'. Boot
+  // crash-recovery on this new instance must NOT reset a job with a live
+  // heartbeat — a reset here would yank an in-flight job back to 'queued',
+  // where it could be re-claimed and re-run: real, paid research executed
+  // twice.
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'running', requested_by: userId, started_at: new Date().toISOString() })
+    .insert({
+      company_id: companyId,
+      status: 'running',
+      requested_by: userId,
+      started_at: new Date().toISOString(),
+      heartbeat_at: new Date().toISOString(),
+    })
     .select('id')
     .single();
   if (jobError) throw jobError;

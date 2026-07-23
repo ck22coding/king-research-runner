@@ -13,6 +13,16 @@ import path from 'node:path';
 const ENV_PATH = '/Users/carterking/Projects/dad/.env';
 process.loadEnvFile(ENV_PATH);
 
+// Test-only default: index.mjs no longer hardcodes PLUGIN_DIR (Task 7 —
+// production must ship with no dev-machine paths), so tests that exercise the
+// real schema-gated pipeline (lifecycle/timeout/per-user) need it pointed at
+// the local plugin checkout. Root .env doesn't carry this (dev config, not a
+// secret) — set it here, same "test-only hardcoded dev path" convention as
+// ENV_PATH above, only if the environment hasn't already supplied one.
+if (!process.env.PLUGIN_DIR) {
+  process.env.PLUGIN_DIR = '/Users/carterking/Projects/dad/company-preview/skill/plugins/company-preview';
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER_ROOT = path.join(__dirname, '..');
 const INDEX = path.join(RUNNER_ROOT, 'index.mjs');

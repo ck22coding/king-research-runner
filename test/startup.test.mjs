@@ -42,9 +42,9 @@ test('no CLAUDE_BIN + stripped PATH: exits nonzero, stderr explains claude resol
   assert.match(stderr.toLowerCase(), /resolv.*claude|claude.*resolv/);
 });
 
-test('bogus NEXT_PUBLIC_SUPABASE_ANON_KEY: exits nonzero, stderr explains sign-in failure', async () => {
+test('bogus NEXT_PUBLIC_SUPABASE_ANON_KEY: exits nonzero, stderr explains pairing/login failure', async () => {
   const env = { ...process.env, NEXT_PUBLIC_SUPABASE_ANON_KEY: 'bogus' };
   const { code, stderr } = await runChild(env, 15000);
   assert.notEqual(code, 0);
-  assert.match(stderr.toLowerCase(), /sign-in|sign in/);
+  assert.match(stderr.toLowerCase(), /no valid login.*re-pair this computer/s);
 });

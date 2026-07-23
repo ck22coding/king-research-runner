@@ -11,6 +11,8 @@ const structuredOutput = {
       text: 'Runner Test Co repeat-fixture story (same URL every run).',
       fact_date: '2026-07-15',
       group_key: null,
+      importance: 5,
+      stats: null,
       sources: [
         {
           publisher: 'Test Wire',
