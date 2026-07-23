@@ -19,7 +19,15 @@ try { process.loadEnvFile(process.env.KR_ENV_FILE ?? '.env'); } catch {}
 // is passed to claude only when this is set; unset means the plugin is
 // installed via the marketplace instead, see runClaude below).
 const PLUGIN_DIR = process.env.PLUGIN_DIR || null;
-const SCHEMA_PATH = PLUGIN_DIR ? path.join(PLUGIN_DIR, 'references', 'output-schema.json') : null;
+// The schema is always needed (passed as literal --json-schema text, not a
+// path claude resolves — see runClaude below), regardless of PLUGIN_DIR, so
+// a marketplace install (PLUGIN_DIR unset) falls back to the copy shipped
+// in this package. ponytail: this bundled copy can drift from the plugin
+// repo's canonical references/output-schema.json; re-sync it by hand if the
+// schema changes — a build step is the upgrade path if that gets missed.
+const SCHEMA_PATH = PLUGIN_DIR
+  ? path.join(PLUGIN_DIR, 'references', 'output-schema.json')
+  : new URL('./references/output-schema.json', import.meta.url);
 
 // URL + anon key get baked public defaults (they are public by design; RLS
 // is the security boundary) so npx users with no env file still work.

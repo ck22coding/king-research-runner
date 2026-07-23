@@ -4,7 +4,7 @@
   "description": "Local research runner for King Research CRM — your computer is the backend.",
   "type": "module",
   "bin": { "king-research-runner": "./index.mjs" },
-  "files": ["index.mjs", "README.md"],
+  "files": ["index.mjs", "README.md", "references/output-schema.json"],
   "engines": { "node": ">=20.12" },
   "license": "MIT",
   "scripts": {
