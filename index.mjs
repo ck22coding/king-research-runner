@@ -347,6 +347,27 @@ async function runRankingPass(companyId, { reviewedOnly = false } = {}) {
 }
 
 async function runSynthesisPass(companyId) {
+  // Fact watermark BEFORE the input fetch (codex): generated_at is stamped
+  // with this, not wall-clock time, so a curation landing mid-generation
+  // (its reviewed_at > watermark) always reads as newer than the prose and
+  // re-locks the PDF. Ordering matters — watermark first, then facts: a
+  // write between the two makes the prose look stale (harmless re-generate),
+  // never falsely fresh. Same event definition as the web's lastFactEvent:
+  // max(created_at, reviewed_at) over ALL report-section facts, any status.
+  const { data: stampRows, error: stampError } = await supabase
+    .from('facts')
+    .select('created_at, reviewed_at')
+    .eq('company_id', companyId)
+    .in('section', Object.keys(SECTION_WINDOWS_MONTHS));
+  if (stampError) throw stampError;
+  let watermark = null;
+  for (const r of stampRows ?? []) {
+    for (const t of [r.created_at, r.reviewed_at]) {
+      if (t && (!watermark || new Date(t) > new Date(watermark))) watermark = t;
+    }
+  }
+  const generatedAt = watermark ?? new Date().toISOString();
+
   // Re-fetch AFTER the ranking pass so paragraph emphasis follows the fresh
   // significance order.
   const bySection = await fetchInWindowFacts(companyId, { reviewedOnly: true });
@@ -358,7 +379,7 @@ async function runSynthesisPass(companyId) {
     // of a Generate loop that could never satisfy it.
     const { error: clearError } = await supabase
       .from('companies')
-      .update({ report_narrative: { sections: {}, generated_at: new Date().toISOString() } })
+      .update({ report_narrative: { sections: {}, generated_at: generatedAt } })
       .eq('id', companyId);
     if (clearError) throw clearError;
     return;
@@ -440,7 +461,7 @@ async function runSynthesisPass(companyId) {
 
   const { error: writeError } = await supabase
     .from('companies')
-    .update({ report_narrative: { sections, generated_at: new Date().toISOString() } })
+    .update({ report_narrative: { sections, generated_at: generatedAt } })
     .eq('id', companyId);
   if (writeError) throw writeError;
   console.log(`synthesis pass: wrote narrative (${Object.keys(sections).join(', ')}) for company ${companyId}`);
