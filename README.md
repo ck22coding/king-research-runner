@@ -119,8 +119,39 @@ Storing it needs one column:
 alter table public.enrichment_jobs add column if not exists cost jsonb;
 ```
 
-One run tells you about one run. To find the stage worth actually rewriting,
-aggregate across jobs — the expensive stage is rarely the slow one:
+### Asking about spend
+
+One run tells you about one run. `scripts/costs.mjs` aggregates across jobs,
+which is where the answer to "what should I optimise" actually lives:
+
+```
+KR_ENV_FILE=~/Projects/dad/.env node scripts/costs.mjs           # last 30 days
+KR_ENV_FILE=~/Projects/dad/.env node scripts/costs.mjs --days 7
+KR_ENV_FILE=~/Projects/dad/.env node scripts/costs.mjs --json    # raw
+```
+
+```
+=== 2 jobs, last 30 days — $5.51 total ===
+
+STAGE                 RUNS   TOTAL$    AVG$  SHARE   AVG WEB   CACHE r:w   AVG s  FAILED
+topic financials         2     1.64   0.820    30%       8.0         7.9    296       0
+synthesis                2     1.19   0.595    22%       0.0         5.1    144       0
+verify                   2     0.39   0.195     7%       3.5         0.2     58       0
+scout                    2     0.17   0.085     3%       2.5         1.3     40       0
+topic news               1     0.00   0.000     0%       0.0           —   1200       1
+```
+
+Ranked by **total**, not average — a stage can be cheap per run and still
+dominate the bill by running on every job. `CACHE r:w` below 1 (verify, above)
+means that stage rebuilds its prompt prefix every run rather than reusing it;
+reads bill ~10x cheaper than writes, so that is usually the cheapest fix
+available. `FAILED` counts calls that died before reporting, which is why the
+totals are a floor.
+
+Read-only, and needs `SUPABASE_SERVICE_ROLE_KEY` so it can see every user's
+jobs. It is excluded from the npm package (`files` in package.json).
+
+To go beyond what the script reports, the same rollup in SQL:
 
 ```sql
 select n->>'node'                            as node,
