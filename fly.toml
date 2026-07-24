@@ -1,0 +1,24 @@
+# Fly.io worker app. No [http_service] and no ports on purpose: the runner
+# polls Supabase outbound and never accepts a request, so there is nothing to
+# route to and nothing that could wake it from a stopped state. It has to stay
+# up, which is why there is no auto-stop here.
+app = "king-research-runner"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUNNER_QUEUE = "prod"
+  RUNNER_CONCURRENCY = "1"
+  RUNNER_MODE = "cloud"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # Six topic nodes run concurrently within one job, each its own Claude CLI
+  # process. 2GB is sized for that fan-out at RUNNER_CONCURRENCY=1 — raising
+  # concurrency without raising this will OOM mid-research.
+  memory = "2gb"
+
+# Secrets are NOT set here — `fly secrets set` keeps them out of the repo:
+#   fly secrets set SUPABASE_SERVICE_ROLE_KEY=... ANTHROPIC_API_KEY=...

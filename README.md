@@ -49,6 +49,90 @@ All optional; sane defaults cover a normal install.
 | `POLL_INTERVAL_MS` | `5000` | How often an idle worker checks for a new job. |
 | `CLAUDE_BIN` | resolved via `command -v claude` | Absolute path override for non-interactive parents that don't inherit your shell's `PATH`. |
 | `PLUGIN_DIR` | unset | Dev only: path to a local `company-preview/skill` checkout, passed as `--plugin-dir`. Leave unset for the marketplace-installed plugin. |
+| `RUNNER_MODE` | unset | Set to `cloud` for the shared cloud runner. See below. |
+| `SUPABASE_SERVICE_ROLE_KEY` | unset | Required by (and only used in) cloud mode. Never set `RUNNER_MODE=cloud` on a laptop. |
+
+## Cloud mode
+
+`RUNNER_MODE=cloud` turns this same process into the *shared* runner: no
+pairing, no stored session, and it serves **every** user's jobs rather than one
+person's. Local runners keep working unchanged.
+
+The mode has to be named explicitly — having the service key in your
+environment is *not* enough, on purpose. That key already lives in dev `.env`
+files because the website's server routes need it, so switching on its presence
+would silently turn a laptop runner into one that serves and bills for the
+whole workspace. Cloud mode also fails fast at boot if the key is missing,
+rather than falling back to a pairing prompt a container can never answer.
+
+Two things differ, and both follow from there being no human at the keyboard:
+
+- **Billing changes.** A container has no interactive `claude` login, so it
+  authenticates with `ANTHROPIC_API_KEY` and research is billed per token
+  instead of riding a Max/Pro subscription. That is a cost model decision, not
+  a deployment detail — set a monthly limit in the Anthropic console before
+  the first deploy.
+- **The service key bypasses RLS.** It can read and write every row, which is
+  precisely why the runner can serve all users without a policy change. Keep
+  it in `fly secrets` (or your platform's secret store) and out of the repo,
+  the image, and any log line.
+
+Deploy (`Dockerfile` + `fly.toml` are in this repo):
+
+```
+fly launch --no-deploy
+fly secrets set SUPABASE_SERVICE_ROLE_KEY=... ANTHROPIC_API_KEY=...
+fly deploy
+```
+
+The image vendors the `company-preview` plugin at build time rather than
+installing it from the marketplace at runtime — pin `PLUGIN_REF` to a tag if
+you don't want a plugin change altering research behaviour on the next deploy.
+
+## Cost reporting
+
+Every `claude -p` call returns what it cost, and the pipeline runs each stage
+as its own process, so the per-stage numbers are measured rather than
+apportioned. After each job the runner prints the breakdown most-expensive
+first and writes the same structure to `enrichment_jobs.cost`:
+
+```
+job 9f3c… cost $3.11 over 10 claude calls
+  topic financials     $0.930  claude-sonnet-4-6   in 41k  out 3.1k  cache r180k/w22k  web 9  312s
+  synthesis            $0.640  claude-sonnet-4-6   in 28k  out 5.0k  cache r91k/w18k   web 0  148s
+  topic news            FAILED  -                  in 0    out 0     cache r0/w0       web 0  1200s
+  …
+```
+
+Read it as: **the dollar column tells you where to optimize**, `web` is what
+the per-section fetch budgets actually control, and `cache r…/w…` is the
+cheapest thing to fix when a stage shows a large write with almost no read —
+reads bill at roughly a tenth of writes, so a churning prompt prefix pays full
+freight on every single run. `FAILED` marks a call that died before it could
+report (usually the 20-minute timeout); it still spent money, so the total is a
+floor, not an exact figure — the summary line says so when any are present.
+
+Storing it needs one column:
+
+```sql
+alter table public.enrichment_jobs add column if not exists cost jsonb;
+```
+
+One run tells you about one run. To find the stage worth actually rewriting,
+aggregate across jobs — the expensive stage is rarely the slow one:
+
+```sql
+select n->>'node'                            as node,
+       count(*)                              as runs,
+       round(avg((n->>'usd')::numeric), 3)   as avg_usd,
+       round(sum((n->>'usd')::numeric), 2)   as total_usd,
+       round(avg((n->>'web')::numeric), 1)   as avg_fetches
+from public.enrichment_jobs j,
+     jsonb_array_elements(j.cost->'nodes') n
+where j.cost is not null
+group by 1
+order by total_usd desc;
+```
 
 ## How it runs jobs
 
@@ -81,7 +165,9 @@ output — never by the `claude` process directly.
 
 The runner's own database access is scoped down to Postgres row-level
 security: it's signed in as you, and can only claim/update jobs where
-`requested_by` is your own user id.
+`requested_by` is your own user id. (In cloud mode that boundary is
+deliberately absent — see above — which is the whole reason the service key
+has to be treated as a secret rather than as configuration.)
 
 ## Self-hosting
 
