@@ -6,8 +6,7 @@ runner, signed in as *you* via a one-time pairing code, polls for jobs where
 `requested_by` is your account, claims one, runs the `company-preview` skill
 via `claude -p`, and writes the results (facts, sources, company
 tldr/status) back to Supabase. A web click alone can't run research
-directly — `claude -p` has to run on your machine (Anthropic policy forbids
-subscription tokens powering a hosted backend), so a runner has to be up on
+directly — `claude -p` has to run on your machine, so a runner has to be up on
 your machine for your jobs to get picked up. It's a single resident process:
 start it and leave it running.
 
