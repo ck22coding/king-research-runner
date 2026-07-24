@@ -3,6 +3,7 @@
 // one at a time, invokes the company-preview claude -p skill, and writes
 // suggested facts/sources back to the DB.
 import { execSync, spawn } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
@@ -81,7 +82,30 @@ try {
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Cloud mode: this process is THE shared runner rather than one person's
+// laptop. It skips pairing (a container has no TTY to prompt on and no home
+// directory worth persisting to) and claims every user's jobs instead of only
+// its owner's, because the service-role key bypasses RLS — which is also why
+// that key must never leave the container.
+//
+// Deliberately an EXPLICIT opt-in and not just "is the service key set". The
+// key legitimately lives in dev .env files already (the website's server
+// routes need it), so keying off its presence would silently flip a laptop
+// runner into serving — and billing — every user in the workspace. Requiring
+// the mode to be named makes the dangerous state impossible to reach by
+// accident, and a cloud deploy that forgets the key fails loudly at boot
+// instead of quietly falling back to a pairing prompt it can never answer.
+// Per-job cost tally, read by checkShape further down — see "Cost telemetry".
+const jobCosts = new AsyncLocalStorage();
+
+const CLOUD = process.env.RUNNER_MODE === 'cloud';
+const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+if (CLOUD && !SERVICE_KEY) {
+  console.error('FATAL: RUNNER_MODE=cloud requires SUPABASE_SERVICE_ROLE_KEY.');
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, CLOUD ? SERVICE_KEY : SUPABASE_ANON_KEY);
 
 // Runner identity: a stored refresh token (from pairing) is refreshed on
 // every start; failing that, a TTY prompts for a fresh pairing code; failing
@@ -127,15 +151,19 @@ async function ensureSession() {
   return data.session.user;
 }
 
-const ME = await ensureSession();
-console.log(`signed in as ${ME.email}`);
-
-// Supabase rotates refresh tokens in the background during long resident
-// runs; persist every rotation or the stored token goes stale and the next
-// start forces a needless re-pair.
-supabase.auth.onAuthStateChange((_event, session) => {
-  if (session?.refresh_token) saveCreds(session);
-});
+// In cloud mode there is nobody to sign in as: the service key authenticates
+// the process itself, and ME.id stays null so the per-user filters below drop
+// out rather than silently matching nothing.
+const ME = CLOUD ? { id: null, email: 'cloud (service role)' } : await ensureSession();
+if (!CLOUD) {
+  console.log(`signed in as ${ME.email}`);
+  // Supabase rotates refresh tokens in the background during long resident
+  // runs; persist every rotation or the stored token goes stale and the next
+  // start forces a needless re-pair. A service key has no session to rotate.
+  supabase.auth.onAuthStateChange((_event, session) => {
+    if (session?.refresh_token) saveCreds(session);
+  });
+}
 
 console.log(`runner started: queue '${RUNNER_QUEUE}' as ${ME.email}, claude at ${CLAUDE_BIN}, worker ${WORKER_ID}`);
 
@@ -467,7 +495,7 @@ async function runRankingPass(companyId, { reviewedOnly = false } = {}) {
     for (const f of list) promptParts.push(`${f.id}: ${f.text.replace(/\s+/g, ' ').slice(0, 300)} (${f.fact_date})`);
   }
   const result = await runRankClaude(promptParts.join('\n'), JSON.stringify(schema));
-  const shape = checkShape(result);
+  const shape = checkShape(result, 'rank');
   if (!shape.ok) throw new Error(`ranking call failed: ${shape.error}`);
 
   for (const [section, list] of bySection) {
@@ -588,7 +616,7 @@ async function runSynthesisPass(companyId) {
   }
 
   const result = await runRankClaude(promptParts.join('\n'), JSON.stringify(schema));
-  const shape = checkShape(result);
+  const shape = checkShape(result, 'synthesis');
   if (!shape.ok) throw new Error(`synthesis call failed: ${shape.error}`);
 
   // Runtime sanitation independent of the model schema (codex review): trim,
@@ -629,38 +657,46 @@ function snippet(s, n = 300) {
 // would already have caught for it (spawn error, non-zero exit). Must run to
 // completion — and pass — before any facts/sources/company write is
 // attempted. Returns { ok: true, structured } or { ok: false, error }.
-function checkShape({ stdout, stderr, code, spawnError, timedOut, overflowed, timeoutMs = CLAUDE_TIMEOUT_MS }) {
+// `node` labels this call in the per-job cost readout. Every claude call in the
+// runner funnels through here, which makes this the one place that has to know
+// how to read cost off a result — including the failure paths, where the call
+// still spent money but can't report how much.
+function checkShape(
+  { stdout, stderr, code, spawnError, timedOut, overflowed, timeoutMs = CLAUDE_TIMEOUT_MS },
+  node = 'claude'
+) {
+  const bad = (error) => {
+    noteCost(node, null, error);
+    return { ok: false, error };
+  };
   if (overflowed) {
-    return {
-      ok: false,
-      error: `claude output exceeded the 10MB cap and the process was killed. stderr: ${snippet(stderr)}`,
-    };
+    return bad(`claude output exceeded the 10MB cap and the process was killed. stderr: ${snippet(stderr)}`);
   }
   if (timedOut) {
-    return {
-      ok: false,
-      error: `claude -p hit its ${timeoutMs}ms timeout and was killed. stderr: ${snippet(stderr)} stdout: ${snippet(stdout)}`,
-    };
+    return bad(
+      `claude -p hit its ${timeoutMs}ms timeout and was killed. stderr: ${snippet(stderr)} stdout: ${snippet(stdout)}`
+    );
   }
   if (spawnError) {
-    return { ok: false, error: `claude process failed to spawn: ${spawnError.message}` };
+    return bad(`claude process failed to spawn: ${spawnError.message}`);
   }
   if (code !== 0) {
-    return {
-      ok: false,
-      error: `claude exited with code ${code}. stderr: ${snippet(stderr)} stdout: ${snippet(stdout)}`,
-    };
+    return bad(`claude exited with code ${code}. stderr: ${snippet(stderr)} stdout: ${snippet(stdout)}`);
   }
   let parsed;
   try {
     parsed = JSON.parse(stdout);
   } catch (err) {
-    return { ok: false, error: `claude stdout did not parse as JSON (${err.message}). stdout: ${snippet(stdout)}` };
+    return bad(`claude stdout did not parse as JSON (${err.message}). stdout: ${snippet(stdout)}`);
   }
   if (!Array.isArray(parsed)) {
-    return { ok: false, error: `claude stdout did not parse as a JSON array. stdout: ${snippet(stdout)}` };
+    return bad(`claude stdout did not parse as a JSON array. stdout: ${snippet(stdout)}`);
   }
-  const structured = parsed.at(-1)?.structured_output;
+  // Last element is the CLI's `result` object: structured_output plus
+  // total_cost_usd / usage / modelUsage / duration_ms.
+  const result = parsed.at(-1);
+  noteCost(node, result);
+  const structured = result?.structured_output;
   if (structured === null || typeof structured !== 'object' || Array.isArray(structured)) {
     return {
       ok: false,
@@ -724,6 +760,12 @@ function checkFacts(facts) {
 // between claim and first beat) — with the old code retired, any such
 // running row is by definition dead. Scoped to this queue so a prod sweep
 // can't yank a parallel test run's rows (and vice versa).
+//
+// Deliberately NOT scoped to one owner, in either mode: the stale-heartbeat
+// filter is what makes this safe, and it holds regardless of who requested the
+// row. A laptop runner's genuinely-live job keeps beating and is left alone; a
+// crashed one is dead no matter whose it was, and in cloud mode this runner is
+// the one that will pick it back up.
 const staleCutoff = new Date(Date.now() - LEASE_STALE_MS).toISOString();
 const { error: recoverError } = await supabase
   .from('enrichment_jobs')
@@ -837,6 +879,84 @@ function makeKillRef() {
   };
 }
 
+// ---------- Cost telemetry ----------
+// Every `claude -p --output-format json` run ends with a result object that
+// reports what that call actually cost and how many tokens it moved. Since the
+// diamond already runs each node as its own process, per-node attribution is
+// MEASURED, not estimated — we never do token math ourselves.
+//
+// AsyncLocalStorage keeps the tally per job without threading a collector
+// through eight call signatures: workers run jobs concurrently and each job's
+// store is isolated for the whole async tree beneath it, fan-out included.
+// ponytail: stdlib, and the alternative (hanging an array off killRef) would
+// overload a handle that means "stop the child", which is a different job.
+// (`jobCosts` itself is declared up with the other module constants, because
+// checkShape above reads it and a const declared below would sit in its
+// temporal dead zone.)
+
+// `result` is the parsed final object, or null when the call died before
+// producing one (timeout, crash, non-zero exit). A dead call still spent real
+// money — recording it with usd:null keeps the readout honest rather than
+// quietly under-reporting the run.
+function noteCost(node, result, error = null) {
+  const store = jobCosts.getStore();
+  if (!store) return;
+  const usage = result?.usage ?? {};
+  const models = Object.keys(result?.modelUsage ?? {});
+  store.nodes.push({
+    node,
+    model: models.join('+') || null,
+    usd: result?.total_cost_usd ?? null,
+    ms: result?.duration_ms ?? null,
+    in: usage.input_tokens ?? 0,
+    out: usage.output_tokens ?? 0,
+    // Cache reads and writes are split because they price roughly 10x apart.
+    // A node showing a big cache_write and near-zero cache_read is paying full
+    // freight every run for a prefix it could be reusing — usually the single
+    // cheapest thing to fix, and invisible if you only look at the dollar total.
+    cache_read: usage.cache_read_input_tokens ?? 0,
+    cache_write: usage.cache_creation_input_tokens ?? 0,
+    // Research nodes live or die on fetch volume; this is the number the
+    // per-section fetch budgets in SKILL.md are actually tuning.
+    web:
+      (usage.server_tool_use?.web_search_requests ?? 0) +
+      (usage.server_tool_use?.web_fetch_requests ?? 0),
+    error,
+  });
+}
+
+// Prints the breakdown most-expensive-first (so the thing worth optimizing is
+// the first line you read) and stores it on the job row so the site can show
+// it without anyone tailing container logs.
+async function recordCost(jobId) {
+  const store = jobCosts.getStore();
+  if (!store || store.nodes.length === 0) return;
+  const nodes = store.nodes.slice().sort((a, b) => (b.usd ?? 0) - (a.usd ?? 0));
+  const usd = nodes.reduce((sum, n) => sum + (n.usd ?? 0), 0);
+  const unpriced = nodes.filter((n) => n.usd === null).length;
+
+  console.log(
+    `job ${jobId} cost $${usd.toFixed(2)} over ${nodes.length} claude calls` +
+      (unpriced ? ` — ${unpriced} died before reporting, so real spend is higher` : '')
+  );
+  for (const n of nodes) {
+    console.log(
+      `  ${n.node.padEnd(20)}` +
+        `${(n.usd === null ? 'FAILED' : `$${n.usd.toFixed(3)}`).padStart(9)}  ` +
+        `${(n.model ?? '-').padEnd(28)}` +
+        `in ${n.in}  out ${n.out}  cache r${n.cache_read}/w${n.cache_write}  ` +
+        `web ${n.web}  ${Math.round((n.ms ?? 0) / 1000)}s`
+    );
+  }
+
+  const { error } = await supabase
+    .from('enrichment_jobs')
+    .update({ cost: { usd, unpriced, nodes } })
+    .eq('id', jobId);
+  // Telemetry must never turn a finished job into a failed one.
+  if (error) console.error(`cost write failed (job itself completed fine): ${error.message}`);
+}
+
 // ---------- Diamond nodes ----------
 // Every node is one bounded `claude -p`. They share this wrapper for the one
 // retry the single-call path already did: a "529 Overloaded" dies in seconds
@@ -865,7 +985,7 @@ async function runScout({ name, domain, newsroomUrl }, killRef) {
     schemaText: SCOUT_SCHEMA_TEXT,
     timeoutMs: SCOUT_TIMEOUT_MS,
   });
-  const shape = checkShape(result);
+  const shape = checkShape(result, 'scout');
   if (!shape.ok) throw new Error(`scout node failed: ${shape.error}`);
   const s = shape.structured;
   if (typeof s.identity_ok !== 'boolean') {
@@ -909,7 +1029,7 @@ async function runTopic(section, ctx, killRef) {
       schemaText: topicSchemaText(section),
       timeoutMs: TOPIC_TIMEOUT_MS,
     });
-    const shape = checkShape(result);
+    const shape = checkShape(result, `topic ${section}`);
     if (!shape.ok) throw new Error(shape.error);
     // Same gate as the single-call path: a fan-out node's facts must clear
     // the schema walk before they are eligible for the merge.
@@ -969,7 +1089,7 @@ async function runVerifyGate(facts, { companyType, killRef }) {
         schemaText: VERIFY_SCHEMA_TEXT,
         timeoutMs: VERIFY_TIMEOUT_MS,
       });
-      const shape = checkShape(result);
+      const shape = checkShape(result, 'verify');
       if (!shape.ok) {
         console.error(`verify gate: skeptic call failed, keeping the fact unverified: ${shape.error}`);
         return;
@@ -1012,7 +1132,7 @@ async function runTldrNode(facts, contextBrief, killRef) {
     .join('\n');
 
   const result = await runRankClaude(prompt, TLDR_SCHEMA_TEXT, { model: nodeModel(TLDR_MODEL), killRef });
-  const shape = checkShape(result);
+  const shape = checkShape(result, 'tldr');
   if (!shape.ok) throw new Error(`tldr node failed: ${shape.error}`);
   const tldr = shape.structured.tldr;
   if (typeof tldr !== 'string' || tldr.trim().length === 0) throw new Error('tldr node returned an empty tldr');
@@ -1066,17 +1186,25 @@ let shuttingDown = false;
 const MAX_CONSECUTIVE_POLL_ERRORS = 20;
 let consecutivePollErrors = 0;
 
+// Owner scope. A laptop runner may only touch its own user's jobs (RLS says so
+// too); the shared cloud runner serves everyone, so the filter drops away.
+// One helper rather than two inline conditionals: the poll and the claim MUST
+// agree on scope, or the runner claims rows it never polls — or worse, polls
+// rows it can't claim and spins.
+const mine = (q) => (CLOUD ? q : q.eq('requested_by', ME.id));
+
 async function worker() {
   while (!shuttingDown) {
     // ponytail: 10-row scan window — enough to skip past a locked company's
     // queued jobs at this scale; if all 10 are on locked companies we just
     // wait one poll interval.
-    const { data: queued, error: queuedError } = await supabase
-      .from('enrichment_jobs')
-      .select('*')
-      .eq('status', 'queued')
-      .eq('queue_name', RUNNER_QUEUE)
-      .eq('requested_by', ME.id)
+    const { data: queued, error: queuedError } = await mine(
+      supabase
+        .from('enrichment_jobs')
+        .select('*')
+        .eq('status', 'queued')
+        .eq('queue_name', RUNNER_QUEUE)
+    )
       .order('created_at')
       .limit(10);
     // Transient DB errors while polling must not crash the runner — log,
@@ -1086,9 +1214,11 @@ async function worker() {
       consecutivePollErrors += 1;
       if (consecutivePollErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
         console.error(
-          `FATAL: ${consecutivePollErrors} consecutive poll errors, last: ${queuedError.message} — ` +
-            'halting. If this says "permission denied", the login died: restart the runner, ' +
-            're-pair it (Onboarding → Connect this computer) if that alone does not fix it.'
+          `FATAL: ${consecutivePollErrors} consecutive poll errors, last: ${queuedError.message} — halting. ` +
+            (CLOUD
+              ? 'If this says "permission denied", SUPABASE_SERVICE_ROLE_KEY is missing, wrong, or was rotated.'
+              : 'If this says "permission denied", the login died: restart the runner, and re-pair it ' +
+                '(Onboarding → Connect this computer) if that alone does not fix it.')
         );
         process.exitCode = 1;
         shuttingDown = true;
@@ -1111,10 +1241,21 @@ async function worker() {
     activeCompanies.add(job.company_id);
 
     try {
+      // Scope the cost tally to this job: every claude call underneath records
+      // into this store, and recordCost prints + persists the breakdown once,
+      // on every exit path — a job that fails halfway still spent money, and
+      // that is exactly the run you want the numbers for.
+      const outcome = await jobCosts.run({ nodes: [] }, async () => {
+        try {
+          return await runJob(job);
+        } finally {
+          await recordCost(job.id);
+        }
+      });
       // 'halt' means this worker's failure path could not even record a
       // failure — begin shutdown: siblings drain their current job, then
       // the process exits so the next start's crash-recovery unwedges state.
-      if ((await runJob(job)) === 'halt') {
+      if (outcome === 'halt') {
         shuttingDown = true;
         return;
       }
@@ -1130,19 +1271,19 @@ async function runJob(job) {
   // Atomic lease claim (migration §E): stamps ownership + first heartbeat in
   // the same conditional update. queue_name guard is belt-and-braces — the
   // poll already filters, but a claim must never cross queues.
-  const { data: claimed, error: claimError } = await supabase
-    .from('enrichment_jobs')
-    .update({
-      status: 'running',
-      started_at: new Date().toISOString(),
-      claimed_by: WORKER_ID,
-      heartbeat_at: new Date().toISOString(),
-    })
-    .eq('id', job.id)
-    .eq('status', 'queued')
-    .eq('queue_name', RUNNER_QUEUE)
-    .eq('requested_by', ME.id)
-    .select();
+  const { data: claimed, error: claimError } = await mine(
+    supabase
+      .from('enrichment_jobs')
+      .update({
+        status: 'running',
+        started_at: new Date().toISOString(),
+        claimed_by: WORKER_ID,
+        heartbeat_at: new Date().toISOString(),
+      })
+      .eq('id', job.id)
+      .eq('status', 'queued')
+      .eq('queue_name', RUNNER_QUEUE)
+  ).select();
   if (claimError) {
     console.error(`claim error (will retry): ${claimError.message}`);
     await sleep(POLL_INTERVAL_MS);
@@ -1658,9 +1799,27 @@ if (resynthIdx !== -1) {
 // below) — it must never be the reason this process fails to exit once
 // every worker drains.
 async function beatOnce() {
-  const { error } = await supabase
-    .from('runner_heartbeats')
-    .upsert({ user_id: ME.id, last_seen_at: new Date().toISOString(), hostname: os.hostname() });
+  const now = new Date().toISOString();
+  let rows;
+  if (CLOUD) {
+    // The banner is keyed per user, so the shared runner beats on behalf of
+    // everyone it serves. That keeps "your runner isn't connected" honest in
+    // cloud mode with no web change at all — the existing per-user check just
+    // starts seeing a fresh row it didn't have to know the origin of.
+    const { data: users, error: usersError } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('can_enrich', true);
+    if (usersError) {
+      console.error(`heartbeat failed: ${usersError.message}`);
+      return;
+    }
+    rows = (users ?? []).map((u) => ({ user_id: u.id, last_seen_at: now, hostname: 'cloud' }));
+    if (rows.length === 0) return;
+  } else {
+    rows = [{ user_id: ME.id, last_seen_at: now, hostname: os.hostname() }];
+  }
+  const { error } = await supabase.from('runner_heartbeats').upsert(rows);
   if (error) console.error(`heartbeat failed: ${error.message}`);
 }
 await beatOnce();
