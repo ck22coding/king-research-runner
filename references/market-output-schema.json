@@ -1,0 +1,126 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "market-jumpstart output (full run)",
+  "description": "Structured market-research brief emitted by the market-jumpstart skill. Maps onto the markets/facts/sources tables. Per-section mode uses a smaller schema supplied by the caller ({section, facts, coverage_note, notes}); the fact definition below is the one source of truth for a fact in every mode.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "market",
+    "coverage_note",
+    "facts"
+  ],
+  "properties": {
+    "market": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_market",
+        "geography",
+        "parent_market",
+        "includes",
+        "excludes",
+        "categories",
+        "customer_org_type",
+        "coverage_outlook"
+      ],
+      "description": "The shared vocabulary every section (and every downstream slide) must reuse verbatim. Produced by the scout; echoed back unchanged on a full run.",
+      "properties": {
+        "canonical_market": { "type": "string" },
+        "geography": { "type": "string" },
+        "parent_market": { "type": ["string", "null"] },
+        "includes": { "type": "string", "description": "One sentence: what this market covers." },
+        "excludes": { "type": "string", "description": "One sentence: what is deliberately out of scope." },
+        "categories": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "string" },
+          "description": "Exactly 3 segment names, reused verbatim by every section and every slide that names a segment."
+        },
+        "customer_org_type": {
+          "type": "string",
+          "description": "Buying organization type. Must read naturally after both 'Key players in ___ have' and 'Within ___,' — use an article or a plural, never a bare singular."
+        },
+        "coverage_outlook": {
+          "type": "string",
+          "enum": ["good", "thin", "very thin"],
+          "description": "How much free public coverage this sub-market has. Be pessimistic: 'thin' when only the parent market is broken out by free sources."
+        }
+      }
+    },
+    "coverage_note": {
+      "type": ["string", "null"],
+      "description": "Rendered to the human. What free sources could not supply for this market, stated plainly. Null when coverage was fine. Never an excuse for an invented number — it exists so the number can be absent."
+    },
+    "facts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "section",
+          "text",
+          "fact_date",
+          "group_key",
+          "importance",
+          "stats",
+          "sources"
+        ],
+        "properties": {
+          "section": {
+            "type": "string",
+            "enum": [
+              "definition",
+              "market_size",
+              "segmentation",
+              "vendors",
+              "deals",
+              "challenges",
+              "personas",
+              "processes",
+              "regulatory"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "description": "The fact as a human reads it, with its attribution inline ('… per Grand View Research, 2025'). Prefixed '(dated) ' when stats.year is more than 3 years old. Prefixed 'SUGGESTED CATEGORY: ' on a definition fact proposing an assessment category this section list does not cover."
+          },
+          "fact_date": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "description": "Publication date of the primary source — NOT the year the figure refers to (that is stats.year). Month-only or year-only sources use the first day and say '(date approximate)' in the text."
+          },
+          "group_key": {
+            "type": ["string", "null"],
+            "description": "Shared across facts describing the same underlying item — AND across conflicting estimates of the same quantity (e.g. two TAM figures for US 2024 both get 'tam-us-2024'). Conflicting estimates are kept as separate facts and rendered side by side; they are never merged, averaged, or dropped."
+          },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["publisher", "title", "url", "year"],
+              "properties": {
+                "publisher": { "type": "string" },
+                "title": { "type": ["string", "null"] },
+                "url": { "type": "string", "pattern": "^https?://" },
+                "year": { "type": ["integer", "null"] }
+              }
+            }
+          },
+          "importance": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "9-10 TAM or CAGR from a named research firm / a rule that reshapes the market / a published top-vendor share; 6-8 major acquisition or funding round / published segmentation split / adoption survey / named leader with evidence; 4-5 sourced challenge or pain point / pricing model / persona title / category example; 1-3 color, vendor marketing claim, minor deal."
+          },
+          "stats": {
+            "type": ["object", "null"],
+            "description": "Structured values a source actually states; null when the fact type has no stat shape. Set stats.type to name the shape. Shapes — tam: {type,value,unit,year,geography,segment,basis,is_forecast}; cagr: {type,rate_pct,window_start,window_end,geography,segment,is_forecast}; share: {type,player,share_pct,year,basis}; concentration: {type,top_n,share_pct,year}; segment_split: {type,dimension,year,segments:[{label,share_pct}]}; acquisition: {type,acquirer,target,deal_value,announced}; funding: {type,company,amount,round,lead_investors[]}; adoption: {type,metric,value_pct,population,year}; pricing: {type,model,basis,typical_range}; player: {type,name,domain,tier,category,why}; persona_item: {type,persona:'purchaser'|'user'|'shared',kind:'title'|'pain'|'want',value}; process_item: {type,process,kind:'cost'|'motivation'|'pain',value}; regulation: {type,rule,authority,status:'in_force'|'pending'|'proposed',effective_date,changes}. Only include keys a source states outright — never derive, annualize, convert, sum, or interpolate a value."
+          }
+        }
+      }
+    }
+  }
+}
