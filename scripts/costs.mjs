@@ -49,14 +49,27 @@ const query =
   `enrichment_jobs?select=id,kind,status,created_at,cost,companies(name)` +
   `&cost=not.is.null&created_at=gte.${since}&order=created_at.desc`;
 
-const res = await fetch(`${URL_BASE}/rest/v1/${query}`, {
-  headers: { apikey: KEY, Authorization: `Bearer ${KEY}` },
-});
-if (!res.ok) {
-  console.error(`FATAL: query failed (HTTP ${res.status}): ${await res.text()}`);
-  process.exit(1);
+// PostgREST caps rows per request (Supabase default 1000) — a busy window
+// would otherwise silently return only the newest page and understate the
+// rollup (codex review). Range-paginate until a page comes back short.
+const PAGE_SIZE = 1000;
+const jobs = [];
+for (let offset = 0; ; offset += PAGE_SIZE) {
+  const res = await fetch(`${URL_BASE}/rest/v1/${query}`, {
+    headers: {
+      apikey: KEY,
+      Authorization: `Bearer ${KEY}`,
+      Range: `${offset}-${offset + PAGE_SIZE - 1}`,
+    },
+  });
+  if (!res.ok) {
+    console.error(`FATAL: query failed (HTTP ${res.status}): ${await res.text()}`);
+    process.exit(1);
+  }
+  const page = await res.json();
+  jobs.push(...page);
+  if (page.length < PAGE_SIZE) break;
 }
-const jobs = await res.json();
 
 if (asJson) {
   console.log(JSON.stringify(jobs, null, 2));

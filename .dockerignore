@@ -1,0 +1,12 @@
+# Mirrors .gitignore, but this one matters more: git-ignored files still sit
+# on disk and COPY . . would bake them into the image (codex review) — the
+# service key and any local pairing credentials live in exactly those files.
+.git
+node_modules/
+*.log
+.env*
+credentials.json
+*.key
+*.pem
+.king-research/
+.claude/
