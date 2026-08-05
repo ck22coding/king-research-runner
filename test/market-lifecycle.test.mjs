@@ -22,6 +22,7 @@ const FIXTURE_SUCCESS = path.join(__dirname, 'fixtures', 'fake-market-claude-suc
 const FIXTURE_SCOPE_QUESTION = path.join(__dirname, 'fixtures', 'fake-market-claude-scope-question.mjs');
 const FIXTURE_PARTIAL = path.join(__dirname, 'fixtures', 'fake-market-claude-partial.mjs');
 const FIXTURE_ALL_FAIL = path.join(__dirname, 'fixtures', 'fake-market-claude-all-fail.mjs');
+const FIXTURE_SLOW_SCOUT = path.join(__dirname, 'fixtures', 'fake-market-claude-slow-scout.mjs');
 // Any claude fixture works for the malformed-job test — the guard must fire
 // before a single claude process is ever spawned.
 const FIXTURE_UNUSED = FIXTURE_SUCCESS;
@@ -231,4 +232,49 @@ test('malformed job: neither company_id nor market_id set fails immediately rath
   const finalJob = await pollUntilTerminal(stub, job.id);
   assert.equal(finalJob.status, 'failed', `expected job failed, got '${finalJob?.status}'`);
   assert.match(finalJob.error ?? '', /malformed job/, `expected a malformed-job error, got: ${finalJob?.error}`);
+});
+
+// Regression for the in-process dedup guard keying in-flight jobs by
+// company_id: every market job has company_id === null, and a Set treats
+// null as a real member, so once one market job is in flight ANY other
+// market's job — not just the same market's — gets filtered out of every
+// future poll until the first job's finally block clears it. Two workers
+// (RUNNER_CONCURRENCY=2) against two DIFFERENT markets must run both jobs
+// concurrently, not serially.
+test('market enrich: two different markets run concurrently, not serialized by a shared null company_id key', async (t) => {
+  const stub = await startStubSupabase();
+  const marketA = seedMarket(stub);
+  const marketB = seedMarket(stub);
+  const jobA = seedJob(stub, { market_id: marketA.id });
+  const jobB = seedJob(stub, { market_id: marketB.id });
+  const child = spawnMarketRunner(stub, FIXTURE_SLOW_SCOUT, { RUNNER_CONCURRENCY: '2' });
+  t.after(async () => {
+    child.kill('SIGKILL');
+    await stub.close();
+  });
+
+  // Both jobs' fake scout call sleeps 2s, so a fixed runner has a wide window
+  // to claim and run both concurrently. Sample statuses across that window
+  // rather than asserting on a single snapshot, since the exact claim order
+  // between two workers racing the poll is not deterministic.
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  let sawBothRunning = false;
+  let statusA;
+  let statusB;
+  do {
+    statusA = stub.table('enrichment_jobs').find((r) => r.id === jobA.id)?.status;
+    statusB = stub.table('enrichment_jobs').find((r) => r.id === jobB.id)?.status;
+    if (statusA === 'running' && statusB === 'running') sawBothRunning = true;
+    if ((statusA === 'done' || statusA === 'failed') && (statusB === 'done' || statusB === 'failed')) break;
+    await sleep(50);
+  } while (Date.now() < deadline);
+
+  assert.equal(
+    sawBothRunning,
+    true,
+    `expected both jobs to be 'running' at the same time at least once (last seen: A=${statusA}, B=${statusB}) — ` +
+      'if this is false, a market job is blocking every other market\'s jobs via the null company_id dedup key'
+  );
+  assert.equal(statusA, 'done', `expected market A's job done, got '${statusA}'`);
+  assert.equal(statusB, 'done', `expected market B's job done, got '${statusB}'`);
 });
