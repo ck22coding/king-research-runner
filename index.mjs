@@ -949,12 +949,20 @@ async function recordCost(jobId) {
     );
   }
 
-  const { error } = await supabase
+  // claimed_by guard (codex review): runJob's finally always calls this, even
+  // when the lease was lost mid-run. Without the guard a worker that no
+  // longer owns the row would still overwrite `cost` on whatever a
+  // reclaiming worker has since written — an id-only match can't tell "my
+  // job" from "a job with the same id that moved on without me".
+  const { data: written, error } = await supabase
     .from('enrichment_jobs')
     .update({ cost: { usd, unpriced, nodes } })
-    .eq('id', jobId);
+    .eq('id', jobId)
+    .eq('claimed_by', WORKER_ID)
+    .select('id');
   // Telemetry must never turn a finished job into a failed one.
   if (error) console.error(`cost write failed (job itself completed fine): ${error.message}`);
+  else if (!written?.length) console.error(`cost write skipped for job ${jobId}: lease no longer owned by this worker`);
 }
 
 // ---------- Diamond nodes ----------
