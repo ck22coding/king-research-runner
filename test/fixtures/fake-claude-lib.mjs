@@ -24,6 +24,13 @@ export function nodeKind(prompt) {
   if (/^Write the TL;DR/m.test(prompt)) return 'tldr';
   if (/^You are ranking research facts/m.test(prompt)) return 'rank';
   if (/^You are writing the sections of a 2-page company brief/m.test(prompt)) return 'synth';
+  // Market generate job (task 6) — bounded per-slide-group prose calls, one
+  // fixed opening line each so a fixture fails loudly rather than silently
+  // answering the wrong call if a prompt's wording ever changes.
+  if (/^You are writing two fields for a market-assessment deck from definition facts/m.test(prompt)) return 'market-def-tokens';
+  if (/^You are labeling acquisitions in a market-assessment M&A timeline/m.test(prompt)) return 'market-deal-tokens';
+  if (/^You are naming the four fixed ecosystem-tier labels/m.test(prompt)) return 'market-ecosystem-tokens';
+  if (/^You are naming opportunity themes for a market-assessment deck/m.test(prompt)) return 'market-opportunity-tokens';
   return 'unknown';
 }
 

@@ -51,3 +51,19 @@ export function respondMarket({ facts = () => [], scout = MARKET_SCOUT_OK } = {}
   if (kind === 'verify') return emit({ keep: true, reason: 'fixture keeps everything', downgrade: false });
   return emit({});
 }
+
+// Dispatcher for the market GENERATE job's bare calls (task 6): a ranking
+// pass plus four bounded per-slide-group prose calls. Defaults are boring —
+// `rank` returns `{}` (malformed-tolerant: the ranking pass logs it and
+// keeps existing order, same documented behaviour as the company fixtures'
+// default) — so a fixture only has to supply the token groups it actually
+// cares about.
+export function respondMarketGenerate({ rank = {}, definition = {}, dealThemes = {}, ecosystem = {}, opportunities = { opportunities: [] } } = {}) {
+  const kind = nodeKind(promptArg());
+  if (kind === 'rank') return emit(rank);
+  if (kind === 'market-def-tokens') return emit(definition);
+  if (kind === 'market-deal-tokens') return emit(dealThemes);
+  if (kind === 'market-ecosystem-tokens') return emit(ecosystem);
+  if (kind === 'market-opportunity-tokens') return emit(opportunities);
+  return emit({});
+}
