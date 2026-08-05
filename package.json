@@ -12,7 +12,7 @@
   "engines": { "node": ">=20.12" },
   "license": "MIT",
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/topic-graph.test.mjs test/costs.test.mjs test/startup.test.mjs test/lifecycle.test.mjs test/timeout.test.mjs test/pairing.test.mjs test/per-user.test.mjs"
+    "test": "node --test --test-concurrency=1 test/topic-graph.test.mjs test/costs.test.mjs test/run-python.test.mjs test/startup.test.mjs test/lifecycle.test.mjs test/timeout.test.mjs test/pairing.test.mjs test/per-user.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.6"
