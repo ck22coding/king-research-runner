@@ -257,6 +257,84 @@ test('tldr node: its schema demands the prose itself, not a report about it', as
   );
 });
 
+// The synthesis node is ALSO a bare call with no plugin loaded (same reason
+// as the tldr node above), and its prompt body has carried the TONE do/don't
+// rules since 12cc183d — but unlike tldr, nothing ever bound them at the
+// schema description for this path. A field description outranks the prompt
+// body on a bare call (proven on the tldr node); leaving the per-section
+// schema properties bare is the same bug, just not yet caught on this node.
+test('synthesis node: its per-section schema carries the TONE rules, not just the prompt body', async (t) => {
+  const { runner, userId } = await signInRunner();
+  // Own company, not the shared Runner Test Co fixture (mirrors the hostile-
+  // domain test above): findOrCreateRunnerTestCo sweeps ANY queued/running
+  // job on that company as stale, which races with other suites running
+  // concurrently against the same live project.
+  const companyId = await findOrCreateCompany(runner, userId, 'Runner Synth Test Co', 'runner-test-synth.example');
+  const schemaFile = path.join(mkdtempSync(path.join(tmpdir(), 'kr-synth-')), 'schema.json');
+
+  // Reviewed, in-window facts in two different sections — one call covers
+  // both, so the assertion below exercises more than one schema property.
+  // One fact per section (not two) so the ranking pass that runs first in a
+  // 'generate' job has nothing to rank and skips its own claude call.
+  const today = new Date().toISOString().slice(0, 10);
+  const { error: factsError } = await runner.from('facts').insert([
+    {
+      company_id: companyId,
+      section: 'news',
+      text: 'Runner Test Co shipped a fixture feature.',
+      fact_date: today,
+      group_key: null,
+      importance: 5,
+      stats: null,
+      status: 'included',
+      reviewed_at: new Date().toISOString(),
+    },
+    {
+      company_id: companyId,
+      section: 'leadership',
+      text: 'Runner Test Co hired a fixture VP.',
+      fact_date: today,
+      group_key: null,
+      importance: 5,
+      stats: null,
+      status: 'included',
+      reviewed_at: new Date().toISOString(),
+    },
+  ]);
+  if (factsError) throw factsError;
+
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ company_id: companyId, status: 'queued', requested_by: userId, kind: 'generate' })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  const session = await signInTestUser();
+  const child = spawnPaired(session, {
+    CLAUDE_BIN: FIXTURE_RECORD,
+    POLL_INTERVAL_MS: String(POLL_INTERVAL_MS),
+    KR_SYNTH_SCHEMA_FILE: schemaFile,
+  });
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  const finalJob = await pollUntilTerminal(runner, job.id);
+  assert.equal(finalJob.status, 'done', `expected the generate job to finish, got '${finalJob.status}' (error=${finalJob.error})`);
+
+  const synthSchema = JSON.parse(readFileSync(schemaFile, 'utf8'));
+  assert.ok(synthSchema.required.length > 0, 'expected at least one required section in the recorded synthesis schema');
+  for (const section of synthSchema.required) {
+    assert.match(
+      synthSchema.properties[section].description ?? '',
+      /no scene-setting openers/i,
+      `section '${section}' schema property must carry the TONE rules in its description, not just the prompt body`
+    );
+  }
+});
+
 // Failure containment (spec §10): before the topic graph, one section
 // stumbling failed the whole schema-gated array and lost all six. Now a dead
 // topic node costs exactly that topic — the job completes as a partial and
