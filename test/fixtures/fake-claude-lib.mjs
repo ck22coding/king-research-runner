@@ -23,6 +23,7 @@ export function nodeKind(prompt) {
   if (/^You are fact-checking ONE research claim/m.test(prompt)) return 'verify';
   if (/^Write the TL;DR/m.test(prompt)) return 'tldr';
   if (/^You are ranking research facts/m.test(prompt)) return 'rank';
+  if (/^You are writing the sections of a 2-page company brief/m.test(prompt)) return 'synth';
   return 'unknown';
 }
 
@@ -55,5 +56,14 @@ export function respond({ facts = () => [], scout = SCOUT_OK, tldr = 'Runner Tes
   }
   if (kind === 'verify') return emit({ keep: true, reason: 'fixture keeps everything', downgrade: false });
   if (kind === 'tldr') return emit({ tldr });
+  if (kind === 'synth') {
+    // Generic regardless of which sections have facts: read the schema this
+    // call was actually spawned with and answer exactly the keys it
+    // requires, one placeholder paragraph each, rather than a fixed section
+    // list that would drift from SECTION_SYNTH_QUESTIONS.
+    const i = process.argv.indexOf('--json-schema');
+    const required = i === -1 ? [] : JSON.parse(process.argv[i + 1] ?? '{}').required ?? [];
+    return emit(Object.fromEntries(required.map((key) => [key, [`Placeholder paragraph for ${key}.`]])));
+  }
   return emit({});
 }

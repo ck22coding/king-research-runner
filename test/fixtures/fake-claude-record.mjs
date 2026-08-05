@@ -23,6 +23,14 @@ if (process.env.KR_TLDR_SCHEMA_FILE && kind === 'tldr') {
   appendFileSync(process.env.KR_TLDR_SCHEMA_FILE, process.argv[i + 1] ?? '');
 }
 
+// Same technique, for the synthesis node's per-section schema (see
+// KR_TLDR_SCHEMA_FILE above) — recorded to its own file for the same reason:
+// it must not land in KR_RECORD_FILE's exact-node-count assertion.
+if (process.env.KR_SYNTH_SCHEMA_FILE && kind === 'synth') {
+  const i = process.argv.indexOf('--json-schema');
+  appendFileSync(process.env.KR_SYNTH_SCHEMA_FILE, process.argv[i + 1] ?? '');
+}
+
 // One fact, so the run reaches the tldr node — it is skipped entirely when the
 // merge keeps nothing, and the schema recorded above is the point of this
 // fixture. Unique URL so the known_urls drop can't remove it on a re-run.
