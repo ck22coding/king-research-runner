@@ -2315,13 +2315,21 @@ async function runMarketGenerateJob(job) {
   }
 }
 
-// In-flight company ids across all workers in this process. Checked and
-// updated with no await in between, so two workers can never both pass the
-// check for one company — two queued jobs for the same company must run
-// serially (concurrent runs would snapshot the same dedup history and race
-// on the companies row). Complete only because v1 runs exactly ONE runner
-// process (see the boot-recovery comment above).
-const activeCompanies = new Set();
+// In-flight parent ids (company or market) across all workers in this
+// process. Checked and updated with no await in between, so two workers can
+// never both pass the check for one parent — two queued jobs for the same
+// company, or the same market, must run serially (concurrent runs would
+// snapshot the same dedup history and race on the companies/markets row).
+// Complete only because v1 runs exactly ONE runner process (see the
+// boot-recovery comment above).
+//
+// Keyed by parentKey(job), not raw company_id: every market job has
+// company_id === null, and Set treats null as a real member, so keying on
+// company_id alone would let the first in-flight market job block every
+// OTHER market's jobs too (any market, not just its own) until it finishes —
+// collapsing market-job concurrency to 1 regardless of RUNNER_CONCURRENCY.
+const parentKey = (j) => j.company_id ?? `market:${j.market_id}`;
+const activeParents = new Set();
 
 // Flipped when any worker's failure path can't even record a failure. All
 // workers then finish their CURRENT job (protecting in-flight writes) and
@@ -2406,15 +2414,15 @@ async function worker() {
     }
     consecutivePollErrors = 0;
 
-    const job = (queued ?? []).find((j) => !activeCompanies.has(j.company_id));
+    const job = (queued ?? []).find((j) => !activeParents.has(parentKey(j)));
     if (!job) {
       // Nothing claimable right now (queue empty, or every queued row
-      // belongs to a company a sibling worker is already mid-job on) — sleep
-      // and poll again.
+      // belongs to a company/market a sibling worker is already mid-job on)
+      // — sleep and poll again.
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
-    activeCompanies.add(job.company_id);
+    activeParents.add(parentKey(job));
 
     try {
       // Scope the cost tally to this job: every claude call underneath records
@@ -2436,7 +2444,7 @@ async function worker() {
         return;
       }
     } finally {
-      activeCompanies.delete(job.company_id);
+      activeParents.delete(parentKey(job));
     }
   }
 }
@@ -2471,7 +2479,7 @@ async function runJob(job) {
     return;
   }
 
-  console.log(`claimed job ${job.id} (company ${job.company_id})`);
+  console.log(`claimed job ${job.id} (${job.company_id != null ? `company ${job.company_id}` : `market ${job.market_id}`})`);
 
   // One parent, always (spec §4's one-parent constraint): a market job never
   // sets company_id and vice versa. Guarded in code, not left to Postgres
