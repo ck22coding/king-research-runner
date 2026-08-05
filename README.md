@@ -51,6 +51,11 @@ All optional; sane defaults cover a normal install.
 | `PLUGIN_DIR` | unset | Dev only: path to a local `company-preview/skill` checkout, passed as `--plugin-dir`. Leave unset for the marketplace-installed plugin. |
 | `RUNNER_MODE` | unset | Set to `cloud` for the shared cloud runner. See below. |
 | `SUPABASE_SERVICE_ROLE_KEY` | unset | Required by (and only used in) cloud mode. Never set `RUNNER_MODE=cloud` on a laptop. |
+| `MARKET_PLUGIN_DIR` | unset | Dev only: path to a local `market-jumpstart` skill checkout, mirrors `PLUGIN_DIR` but for market jobs. Leave unset for the marketplace-installed plugin. |
+| `MARKET_SCRIPTS_DIR` | unset | Path to `market-assessment/scripts` (`make_spec_skeleton.py`/`fetch_logos.py`/`fill_deck.py`). Required only for a market `generate` job — a runner that never generates a deck never needs it, and a missing value fails only that job, not the process. |
+| `PYTHON_BIN` | resolved via `command -v python3`, lazily on the first market `generate` job claimed | Absolute path override, same reasoning as `CLAUDE_BIN`. Never resolved (and python3 never required) if no market `generate` job is ever claimed. |
+| `MARKET_TEMPLATE_PATH` | unset | Escape hatch only: `fill_deck.py`'s own default template path already resolves relative to itself. |
+| `MARKET_DECK_BUCKET` | `market-decks` | Supabase Storage bucket the built `.pptx` is uploaded to. |
 
 ## Cloud mode
 
