@@ -147,6 +147,68 @@ test('merge: an empty or failed topic node contributes nothing and does not thro
   assert.equal(facts.length, 1);
 });
 
+// The market guard (spec §5). market-jumpstart deliberately gives
+// conflicting TAM/CAGR/etc. estimates the SAME group_key on purpose, so the
+// deck can render them side by side (CHECKLIST.md §2) instead of losing one
+// silently to the merge the shared group_key would otherwise trigger.
+test('merge: a shared group_key does NOT merge two facts whose stats disagree on the same quantity', () => {
+  const { facts, mergedCount } = mergeTopicFacts([
+    node('market_size', [
+      fact({
+        section: 'market_size',
+        group_key: 'tam-us-2026',
+        text: 'TAM is $4.2B, per Grand View Research.',
+        sources: [src('https://grandview.example/report')],
+        stats: { type: 'tam', value: 4.2, unit: 'USD_B', year: 2026, geography: 'US', segment: null },
+      }),
+    ]),
+    node('market_size', [
+      fact({
+        section: 'market_size',
+        group_key: 'tam-us-2026',
+        text: 'TAM is $6.8B, per IDC.',
+        sources: [src('https://idc.example/report')],
+        stats: { type: 'tam', value: 6.8, unit: 'USD_B', year: 2026, geography: 'US', segment: null },
+      }),
+    ]),
+  ]);
+  assert.equal(facts.length, 2, 'disagreeing estimates must both survive, unmerged');
+  assert.equal(mergedCount, 0);
+});
+
+test('merge: a shared group_key still merges when both sides\' stats agree', () => {
+  const { facts, mergedCount } = mergeTopicFacts([
+    node('market_size', [
+      fact({
+        section: 'market_size',
+        group_key: 'tam-us-2026',
+        sources: [src('https://grandview.example/report')],
+        stats: { type: 'tam', value: 4.2, unit: 'USD_B', year: 2026, geography: 'US', segment: null },
+      }),
+    ]),
+    node('market_size', [
+      fact({
+        section: 'market_size',
+        group_key: 'tam-us-2026',
+        sources: [src('https://another.example/report')],
+        stats: { type: 'tam', value: 4.2, unit: 'USD_B', year: 2026, geography: 'US', segment: null },
+      }),
+    ]),
+  ]);
+  assert.equal(facts.length, 1, 'agreeing stats under the same group_key still merge as before');
+  assert.equal(mergedCount, 1);
+  assert.equal(facts[0].sources.length, 2);
+});
+
+test('merge: facts with stats:null are unaffected by the market guard (company behavior unchanged)', () => {
+  const { facts, mergedCount } = mergeTopicFacts([
+    node('financials', [fact({ section: 'financials', group_key: 'acme-series-c', sources: [src('https://tc.example/a')] })]),
+    node('news', [fact({ section: 'news', group_key: 'acme-series-c', sources: [src('https://wsj.example/b')] })]),
+  ]);
+  assert.equal(facts.length, 1, 'null-stats facts still merge on a shared group_key');
+  assert.equal(mergedCount, 1);
+});
+
 test('verify gate targets only risky facts', () => {
   const now = new Date('2026-07-23T00:00:00Z');
   const twoSources = [src('https://a.example/1'), src('https://b.example/2')];
@@ -168,4 +230,54 @@ test('verify gate targets only risky facts', () => {
   );
   // Well-sourced, recent, public, not a rumor — no skeptic call, no cost.
   assert.equal(riskyReason(fact({ sources: twoSources }), { companyType: 'public', now }), null);
+});
+
+// The market branch (spec §6.2). Company behavior above is untouched; these
+// only trigger on market stats.type shapes.
+test('verify gate: market branch — a single-source numeric fact is still "single-source"', () => {
+  const twoSources = [src('https://a.example/1'), src('https://b.example/2')];
+  assert.equal(
+    riskyReason(fact({ section: 'market_size', sources: [src('https://a.example/1')], stats: { type: 'tam', value: 4.2, year: 2026 } })),
+    'single-source'
+  );
+  // sanity: the same fact well-sourced and non-share is not flagged by the
+  // market branch at all.
+  assert.equal(
+    riskyReason(fact({ section: 'market_size', sources: twoSources, stats: { type: 'tam', value: 4.2, year: 2026 }, text: 'TAM is $4.2B.' })),
+    null
+  );
+});
+
+test('verify gate: market branch — every share fact is flagged regardless of source count', () => {
+  const twoSources = [src('https://a.example/1'), src('https://b.example/2')];
+  const reason = riskyReason(
+    fact({ section: 'vendors', sources: twoSources, stats: { type: 'share', player: 'Acme', share_pct: 12, year: 2026 }, text: 'Acme holds 12% share.' })
+  );
+  assert.ok(reason, 'a two-source share fact must still be flagged');
+  assert.notEqual(reason, null);
+});
+
+test('verify gate: market branch — a text number absent from stats is flagged', () => {
+  const twoSources = [src('https://a.example/1'), src('https://b.example/2')];
+  const reason = riskyReason(
+    fact({
+      section: 'market_size',
+      sources: twoSources,
+      text: 'The market grew 22% last year.',
+      stats: { type: 'cagr', rate_pct: 18, window_start: 2025, window_end: 2026 },
+    })
+  );
+  assert.ok(reason, 'a number in the text that stats does not state must be flagged');
+  // sanity: when every number in the text is also in stats, no flag.
+  assert.equal(
+    riskyReason(
+      fact({
+        section: 'market_size',
+        sources: twoSources,
+        text: 'Growing at 18% CAGR from 2025 to 2026.',
+        stats: { type: 'cagr', rate_pct: 18, window_start: 2025, window_end: 2026 },
+      })
+    ),
+    null
+  );
 });
