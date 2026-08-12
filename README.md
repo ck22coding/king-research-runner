@@ -17,10 +17,13 @@ start it and leave it running.
    npm install -g @anthropic-ai/claude-code
    claude login
    ```
-2. Install the research plugin:
+2. Install the research plugins. `king-research` is the *marketplace*; the
+   plugins inside it are `company-preview` (company briefs) and
+   `market-jumpstart` (market assessments) — install both:
    ```
    claude plugin marketplace add ck22coding/king-research
-   claude plugin install king-research@king-research
+   claude plugin install company-preview@king-research
+   claude plugin install market-jumpstart@king-research
    ```
 3. Start the runner and leave it running — it checks for your jobs every
    few seconds:

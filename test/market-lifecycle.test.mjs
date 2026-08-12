@@ -15,7 +15,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { startStubSupabase } from './helpers-stub-db.mjs';
-import { spawnRunner } from './helpers.mjs';
+import { spawnRunner, TEST_QUEUE } from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_SUCCESS = path.join(__dirname, 'fixtures', 'fake-market-claude-success.mjs');

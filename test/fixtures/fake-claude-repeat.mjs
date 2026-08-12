@@ -7,11 +7,11 @@ import { respond } from './fake-claude-lib.mjs';
 
 respond({
   facts: (section) =>
-    section !== 'news'
+    section !== 'growth_signals'
       ? []
       : [
           {
-            section: 'news',
+            section: 'growth_signals',
             text: 'Runner Test Co repeat-fixture story (same URL every run).',
             fact_date: '2026-07-15',
             group_key: null,

@@ -18,6 +18,7 @@ import {
   adminDeleteUser,
   findOrCreateRunnerTestCo,
   spawnPaired,
+  TEST_QUEUE,
 } from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,7 +32,7 @@ test('RLS: user B cannot claim user A job', async () => {
   const companyId = await findOrCreateRunnerTestCo(supabase, a.user.id);
   const { data: job, error: jobError } = await supabase
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, requested_by: a.user.id })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, requested_by: a.user.id })
     .select()
     .single();
   if (jobError) throw jobError;

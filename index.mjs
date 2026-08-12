@@ -225,10 +225,18 @@ const SECTION_ENUM = schema.properties.facts.items.properties.section.enum;
 // topic to sonnet if quality drops, demote if haiku holds. fetchBudget is
 // passed to the skill as `fetch_budget=` (it overrides SKILL.md's soft-cap
 // table) — the hard bound is TOPIC_TIMEOUT_MS below.
+// 5 nodes, not 6: the `news` node was retired 2026-08-12. It was a catch-all
+// that took 82% of all facts ever researched (494 of 605) and, worse, competed
+// with the other nodes for the same events — two nodes slugging one story two
+// ways defeats mergeTopicFacts' URL-overlap guard (which deliberately declines
+// to merge when both facts assert a different non-null group_key), so the same
+// event shipped twice at two importances. Its coverage moved to the sections
+// that already owned those events; growth_signals inherits launches,
+// expansions, regulatory wins and conference presence, so it takes news' larger
+// fetch budget.
 const TOPIC_NODES = {
   leadership: { model: 'haiku', fetchBudget: 4 },
-  news: { model: 'haiku', fetchBudget: 6 },
-  growth_signals: { model: 'haiku', fetchBudget: 4 },
+  growth_signals: { model: 'haiku', fetchBudget: 6 },
   acquisitions_partnerships: { model: 'sonnet', fetchBudget: 6 },
   financials: { model: 'sonnet', fetchBudget: 8 },
   risk_flags: { model: 'sonnet', fetchBudget: 5 },
@@ -377,9 +385,8 @@ class LeaseLostError extends Error {}
 const SECTION_RANK_QUESTIONS = {
   leadership: 'Which of these leadership/people changes is most significant to the company trajectory?',
   acquisitions_partnerships: 'Which of these acquisitions or partnerships is most strategically significant for the company?',
-  news: 'Which of these events is most significant to the company trajectory?',
   financials: 'Which of these financial events most changes the company financial picture?',
-  growth_signals: 'Which of these signals is the strongest evidence of real growth momentum?',
+  growth_signals: 'Which of these — launches, expansions, contract wins, regulatory clearances, hiring — is the strongest evidence of real momentum?',
   risk_flags: 'Which of these risks poses the greatest threat to the company?',
 };
 const RANK_MODEL = 'sonnet'; // ponytail: fixed — ranking is cheap triage, never needs the research model
@@ -400,15 +407,15 @@ const SECTION_SYNTH_QUESTIONS = {
   acquisitions_partnerships: [
     { q: 'What has the company bought, sold, or partnered on — at what price where disclosed — and what strategy do those moves collectively reveal?', sentences: '3-5' },
   ],
-  news: [
-    { q: 'Taken together, what story do the recent announcements tell about where this company is heading?', sentences: '3-5' },
-    { q: 'Which single recent development matters most to the company trajectory, and why?', sentences: '2-3' },
-  ],
   financials: [
     { q: 'How is the company performing financially — most recent quarter or funding round, growth, guidance, and capital moves — and is that picture strengthening or weakening?', sentences: '3-5' },
   ],
+  // Two questions, inherited from the retired `news` section: this section now
+  // carries launches/expansions/regulatory wins as well as hiring and
+  // contracts, so it earns the "what does it add up to" beat news used to own.
   growth_signals: [
-    { q: 'Where is the company visibly investing and expanding — hiring, contracts, customer wins — and how much real momentum does that add up to?', sentences: '2-4' },
+    { q: 'Where is the company visibly investing and expanding — product launches, market or geographic expansion, contracts, customer wins, regulatory clearances, hiring — and how much real momentum does that add up to?', sentences: '3-5' },
+    { q: 'Which single recent development matters most to the company trajectory, and why?', sentences: '2-3' },
   ],
   risk_flags: [
     { q: 'What are the concrete risks facing the company — legal, regulatory, competitive, or execution — and how serious is each?', sentences: '2-4' },

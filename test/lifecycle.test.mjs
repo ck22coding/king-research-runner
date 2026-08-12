@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { signInRunner, signInTestUser, spawnPaired, findOrCreateRunnerTestCo, findOrCreateCompany } from './helpers.mjs';
+import { signInRunner, signInTestUser, spawnPaired, findOrCreateRunnerTestCo, findOrCreateCompany, TEST_QUEUE } from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_SUCCESS = path.join(__dirname, 'fixtures', 'fake-claude-success.mjs');
@@ -77,7 +77,7 @@ test('lifecycle: success fixture takes a queued job to done with suggested facts
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -135,7 +135,7 @@ test('lifecycle: a repeat suggestion (same source URL) is suppressed, job still 
   const insertJob = async () => {
     const { data: job, error } = await runner
       .from('enrichment_jobs')
-      .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+      .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
       .select('id')
       .single();
     if (error) throw error;
@@ -164,7 +164,7 @@ test('fan-out: every node is spawned with its own model and fetch budget', async
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -197,8 +197,7 @@ test('fan-out: every node is spawned with its own model and fetch budget', async
   const EXPECTED = {
     scout: { model: 'haiku', budget: '2' },
     'topic:leadership': { model: 'haiku', budget: '4' },
-    'topic:news': { model: 'haiku', budget: '6' },
-    'topic:growth_signals': { model: 'haiku', budget: '4' },
+    'topic:growth_signals': { model: 'haiku', budget: '6' },
     'topic:acquisitions_partnerships': { model: 'sonnet', budget: '6' },
     'topic:financials': { model: 'sonnet', budget: '8' },
     'topic:risk_flags': { model: 'sonnet', budget: '5' },
@@ -206,7 +205,8 @@ test('fan-out: every node is spawned with its own model and fetch budget', async
   for (const [node, want] of Object.entries(EXPECTED)) {
     assert.deepEqual(spawned.get(node), want, `node '${node}' was not spawned per the spec's model/fetch-cap table`);
   }
-  assert.equal(spawned.size, 7, 'expected exactly the scout plus six topic nodes — no extra research calls');
+  assert.equal(spawned.size, 6, 'expected exactly the scout plus five topic nodes — no extra research calls');
+  assert.equal(spawned.has('topic:news'), false, 'the news node was retired 2026-08-12 — nothing should spawn it');
 });
 
 // The tldr node is the one call that runs with NO plugin loaded, so SKILL.md's
@@ -225,7 +225,7 @@ test('tldr node: its schema demands the prose itself, not a report about it', as
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -280,7 +280,7 @@ test('synthesis node: its per-section schema carries the TONE rules, not just th
   const { error: factsError } = await runner.from('facts').insert([
     {
       company_id: companyId,
-      section: 'news',
+      section: 'growth_signals',
       text: 'Runner Test Co shipped a fixture feature.',
       fact_date: today,
       group_key: null,
@@ -305,7 +305,7 @@ test('synthesis node: its per-section schema carries the TONE rules, not just th
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId, kind: 'generate' })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId, kind: 'generate' })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -351,7 +351,7 @@ test('lifecycle: one dead topic node yields a partial report, not a failed job',
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -394,7 +394,7 @@ test('lifecycle: a job stuck running at boot is not wedged (crash recovery)', as
   const staleStartedAt = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'running', requested_by: userId, started_at: staleStartedAt })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'running', requested_by: userId, started_at: staleStartedAt })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -424,6 +424,7 @@ test('lifecycle: a fresh running job is left alone by a concurrently-started ins
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
     .insert({
+      queue_name: TEST_QUEUE,
       company_id: companyId,
       status: 'running',
       requested_by: userId,
@@ -478,7 +479,7 @@ test('lifecycle: invalid fixture fails the job with zero writes and restores com
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -520,7 +521,7 @@ test('lifecycle: a well-formed envelope with a sourceless fact fails the schema 
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -561,7 +562,7 @@ test('lifecycle: a company with a hostile domain fails input validation before a
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
     .select('id')
     .single();
   if (jobError) throw jobError;
@@ -583,4 +584,51 @@ test('lifecycle: a company with a hostile domain fails input validation before a
   const { data: company, error: companyError } = await runner.from('companies').select('status').eq('id', companyId).single();
   if (companyError) throw companyError;
   assert.equal(company.status, pre.status, 'expected company status untouched by a job that failed input validation');
+});
+
+// The real-money guard the 20260720120000 migration asked for and never got
+// ("every recovery, poll, and claim query must filter queue_name = RUNNER_QUEUE
+// ... this deserves a test"). Without it the suite ran on queue 'prod', where a
+// developer's live paired runner claimed fixture jobs and burned real paid
+// research on them — observed 2026-08-12.
+//
+// Deliberately does NOT use queue 'prod' as the foreign queue: naming prod here
+// would recreate the exact hazard this test exists to prevent. A second test
+// queue proves the same filter.
+test('queue isolation: a runner never claims a job from another queue', async (t) => {
+  const { runner, userId } = await signInRunner();
+  const companyId = await findOrCreateRunnerTestCo(runner, userId);
+  const FOREIGN_QUEUE = `${TEST_QUEUE}-foreign`;
+
+  const { data: job, error: jobError } = await runner
+    .from('enrichment_jobs')
+    .insert({ queue_name: FOREIGN_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
+    .select('id')
+    .single();
+  if (jobError) throw jobError;
+
+  // spawnRunner puts this child on TEST_QUEUE (helpers.mjs), not FOREIGN_QUEUE.
+  const child = await spawnRunner(FIXTURE_SUCCESS);
+  t.after(async () => {
+    killChild(child);
+    await cleanup(runner, companyId, job.id);
+  });
+
+  // Long enough for several poll cycles: a runner that ignores queue_name
+  // claims within one POLL_INTERVAL_MS, so staying 'queued' across many is the
+  // signal. pollUntilTerminal is wrong here — we want it to NOT go terminal.
+  await sleep(POLL_INTERVAL_MS * 6);
+
+  const { data: after, error: afterError } = await runner
+    .from('enrichment_jobs')
+    .select('status, claimed_by')
+    .eq('id', job.id)
+    .single();
+  if (afterError) throw afterError;
+  assert.equal(
+    after.status,
+    'queued',
+    `a runner on '${TEST_QUEUE}' claimed a job on '${FOREIGN_QUEUE}' (status=${after.status}, claimed_by=${after.claimed_by}) — the queue filter is off, and on the real prod queue this spends money`
+  );
+  assert.equal(after.claimed_by, null, 'a foreign-queue job must never be stamped with a claimer');
 });

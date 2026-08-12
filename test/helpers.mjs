@@ -30,6 +30,21 @@ const INDEX = path.join(RUNNER_ROOT, 'index.mjs');
 export const COMPANY_NAME = 'Runner Test Co';
 export const COMPANY_DOMAIN = 'runner-test.example';
 
+// Real-money guard (20260720120000_pdf_pivot_and_job_leases §F). enrichment_jobs
+// .queue_name defaults to 'prod' and index.mjs filters every recovery/poll/claim
+// on RUNNER_QUEUE — so a suite that sets NEITHER puts its fixture jobs in the
+// production queue, where a developer's live runner claims them and runs REAL
+// paid research against the real `claude` binary. Observed 2026-08-12: a live
+// paired runner claimed lifecycle fixture jobs mid-suite, which also made the
+// fan-out test time out waiting for a job it never got to run.
+//
+// Unique per process so parallel suite runs can't claim each other's work
+// either. Used in BOTH directions: spawnRunner puts it in every spawned
+// runner's env, and every fixture job row must carry `queue_name: TEST_QUEUE`.
+// Miss it on an insert and that row silently falls back to 'prod' — the guard
+// is off for that job only, which is exactly how this went unnoticed.
+export const TEST_QUEUE = `test-${process.pid}-${Date.now()}`;
+
 // Shared anon-key client, used by helpers that only need a session/user id
 // rather than a per-call client instance (signInRunner below still returns
 // its own client for callers that need one).
@@ -141,7 +156,9 @@ export function spawnPaired(session, extraEnv = {}) {
 // stderr rather than just an exit code (matches the plumbing startup.test.mjs
 // and lifecycle.test.mjs each roll locally, generalized here for reuse).
 export function spawnRunner(opts = {}) {
-  const env = { ...process.env, ...opts.env };
+  // RUNNER_QUEUE first so an explicit opts.env value still wins (the
+  // queue-isolation test needs to spawn a runner on a DIFFERENT queue).
+  const env = { ...process.env, RUNNER_QUEUE: TEST_QUEUE, ...opts.env };
   const proc = spawn(process.execPath, [INDEX], { cwd: RUNNER_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
 
   let stdoutBuf = '';
