@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { signInRunner, signInTestUser, spawnPaired, findOrCreateRunnerTestCo } from './helpers.mjs';
+import { signInRunner, signInTestUser, spawnPaired, findOrCreateRunnerTestCo, TEST_QUEUE } from './helpers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_HANG = path.join(__dirname, 'fixtures', 'fake-claude-hang.mjs');
@@ -77,7 +77,7 @@ test('timeout: a hung claude run is killed and the job fails with a timeout erro
 
   const { data: job, error: jobError } = await runner
     .from('enrichment_jobs')
-    .insert({ company_id: companyId, status: 'queued', requested_by: userId })
+    .insert({ queue_name: TEST_QUEUE, company_id: companyId, status: 'queued', requested_by: userId })
     .select('id')
     .single();
   if (jobError) throw jobError;

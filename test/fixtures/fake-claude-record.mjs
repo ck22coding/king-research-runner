@@ -36,11 +36,11 @@ if (process.env.KR_SYNTH_SCHEMA_FILE && kind === 'synth') {
 // fixture. Unique URL so the known_urls drop can't remove it on a re-run.
 respond({
   facts: (section) =>
-    section !== 'news'
+    section !== 'growth_signals'
       ? []
       : [
           {
-            section: 'news',
+            section: 'growth_signals',
             text: 'Runner Test Co was created as a fixture for the runner lifecycle tests.',
             fact_date: '2026-07-15',
             group_key: null,

@@ -39,10 +39,10 @@
         "properties": {
           "section": {
             "type": "string",
+            "description": "File by what the event fundamentally IS, never by how it was announced. There is deliberately NO general news/announcements bucket: if an event does not fit one of these five, do not emit it. leadership = a named person joins, leaves, or changes role. acquisitions_partnerships = the company buys, sells, merges, or forms a named partnership/alliance with another named organization — this wins over every other section whenever a second organization is the point of the story, INCLUDING when the announcement reads as a customer win or deployment. financials = earnings, guidance, funding rounds, valuation, capital structure. growth_signals = the company visibly getting bigger under its own steam: product launches, clinical/tech milestones, market or geographic expansion, contract and customer wins with no named partner, regulatory clearances and coverage wins, hiring and headcount, conference presence. risk_flags = anything that could go badly: layoffs, hiring freezes, restructuring, lawsuits, investigations, recalls, warning letters, coverage denials, negative employee sentiment. A single event belongs in exactly ONE section — pick the one matching its primary nature and do not also emit it elsewhere.",
             "enum": [
               "leadership",
               "acquisitions_partnerships",
-              "news",
               "financials",
               "growth_signals",
               "risk_flags"
@@ -63,7 +63,7 @@
               "string",
               "null"
             ],
-            "description": "Shared across facts that describe the same story (e.g. newsroom + third-party coverage of one event)."
+            "description": "Deterministic slug identifying the underlying EVENT, so that separate research passes which never see each other's output still produce a byte-identical key for the same event and it is recognised as one story. Build it as <company>-<other-party-or-subject>-<event-type>, lowercase, words joined by single hyphens, no dates and no publisher — e.g. 'evidently-unc-health-partnership', 'medtronic-hugo-fda-clearance', 'waystar-q2-2026-earnings'. Derive it ONLY from the event itself: never from the headline wording, the article you happened to read, or the section you are filling, since those differ between passes and the same event would then be counted twice. Use event-type words from this fixed list: acquisition, partnership, funding, earnings, launch, expansion, clearance, contract, hiring, layoffs, lawsuit, recall, appointment, departure. Null only when the fact describes no discrete event (e.g. a headcount snapshot)."
           },
           "sources": {
             "type": "array",

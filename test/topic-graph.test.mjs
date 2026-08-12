@@ -7,7 +7,7 @@ import { mergeTopicFacts, riskyReason, normalizeUrl } from '../lib/topic-graph.m
 
 const src = (url, publisher = 'Test Wire') => ({ publisher, title: null, url, year: 2026 });
 const fact = (over = {}) => ({
-  section: 'news',
+  section: 'growth_signals',
   text: 'A thing happened.',
   fact_date: '2026-07-01',
   group_key: null,
@@ -21,7 +21,7 @@ const node = (section, facts) => ({ section, facts, notes: null });
 test('merge: same group_key across two sections collapses to one fact', () => {
   const { facts, mergedCount } = mergeTopicFacts([
     node('financials', [fact({ section: 'financials', group_key: 'acme-series-c', importance: 9, sources: [src('https://tc.example/a')] })]),
-    node('news', [fact({ section: 'news', group_key: 'acme-series-c', importance: 4, sources: [src('https://wsj.example/b')] })]),
+    node('growth_signals', [fact({ section: 'growth_signals', group_key: 'acme-series-c', importance: 4, sources: [src('https://wsj.example/b')] })]),
   ]);
   assert.equal(facts.length, 1, 'expected one merged fact');
   assert.equal(mergedCount, 1);
@@ -36,7 +36,7 @@ test('merge: same group_key across two sections collapses to one fact', () => {
 // it with", per SKILL.md step 7).
 test('merge: an overlapping source URL collapses facts when neither names a rival story', () => {
   const { facts } = mergeTopicFacts([
-    node('news', [fact({ group_key: null, sources: [src('https://tc.example/story')] })]),
+    node('growth_signals', [fact({ group_key: null, sources: [src('https://tc.example/story')] })]),
     node('financials', [
       fact({
         section: 'financials',
@@ -77,7 +77,7 @@ test('merge: a shared URL does NOT merge facts that named different stories', ()
 // story split across two facts — the exact duplicate this edge removes.
 test('merge: a fact bridging two existing groups collapses all three', () => {
   const { facts } = mergeTopicFacts([
-    node('news', [fact({ group_key: 'k1', sources: [src('https://a.example/1')] })]),
+    node('growth_signals', [fact({ group_key: 'k1', sources: [src('https://a.example/1')] })]),
     // No group_key, so the URL guard lets it join something later.
     node('financials', [fact({ section: 'financials', group_key: null, sources: [src('https://b.example/2')] })]),
     // Carries k1 (matches the first) AND b.example/2 (matches the second).
@@ -88,12 +88,12 @@ test('merge: a fact bridging two existing groups collapses all three', () => {
   assert.equal(facts.length, 1, 'the bridging fact must collapse both groups, not just one');
   assert.equal(facts[0].sources.length, 3, 'every distinct source survives the fold');
   assert.equal(facts[0].importance, 9, 'max importance survives across a transitive fold');
-  assert.equal(facts[0].section, 'news', 'the earliest-seen fact still owns the text/section');
+  assert.equal(facts[0].section, 'growth_signals', 'the earliest-seen fact still owns the text/section');
 });
 
 test('merge: distinct stories are left alone', () => {
   const { facts, mergedCount } = mergeTopicFacts([
-    node('news', [fact({ group_key: 'acme-launch', sources: [src('https://a.example/1')] })]),
+    node('growth_signals', [fact({ group_key: 'acme-launch', sources: [src('https://a.example/1')] })]),
     node('risk_flags', [fact({ section: 'risk_flags', group_key: 'acme-lawsuit', sources: [src('https://b.example/2')] })]),
   ]);
   assert.equal(facts.length, 2);
@@ -104,22 +104,22 @@ test('merge: distinct stories are left alone', () => {
 // treated as a matching pair.
 test('merge: null group_keys do not collide with each other', () => {
   const { facts } = mergeTopicFacts([
-    node('news', [fact({ group_key: null, sources: [src('https://a.example/1')] })]),
-    node('news', [fact({ group_key: null, sources: [src('https://b.example/2')] })]),
+    node('growth_signals', [fact({ group_key: null, sources: [src('https://a.example/1')] })]),
+    node('growth_signals', [fact({ group_key: null, sources: [src('https://b.example/2')] })]),
   ]);
   assert.equal(facts.length, 2, 'null is not an identity');
 });
 
 test('merge: a fact citing one URL twice keeps a single source row', () => {
   const { facts } = mergeTopicFacts([
-    node('news', [fact({ sources: [src('https://a.example/1'), src('https://www.a.example/1/')] })]),
+    node('growth_signals', [fact({ sources: [src('https://a.example/1'), src('https://www.a.example/1/')] })]),
   ]);
   assert.equal(facts[0].sources.length, 1, 'www./trailing-slash variants are the same URL');
 });
 
 test('merge: null fact_date and stats are filled in from the merged-in fact', () => {
   const { facts } = mergeTopicFacts([
-    node('news', [fact({ group_key: 'k', fact_date: null, stats: null, sources: [src('https://a.example/1')] })]),
+    node('growth_signals', [fact({ group_key: 'k', fact_date: null, stats: null, sources: [src('https://a.example/1')] })]),
     node('financials', [fact({ section: 'financials', group_key: 'k', fact_date: '2026-06-01', stats: { amount_raised: '$50M' }, sources: [src('https://b.example/2')] })]),
   ]);
   assert.equal(facts[0].fact_date, '2026-06-01');
@@ -133,7 +133,7 @@ test('merge: known_urls drops a merged fact even when only one of its URLs is kn
   const known = new Set([normalizeUrl('https://tc.example/story')]);
   const { facts, droppedKnown } = mergeTopicFacts(
     [
-      node('news', [fact({ group_key: 'k', sources: [src('https://tc.example/story')] })]),
+      node('growth_signals', [fact({ group_key: 'k', sources: [src('https://tc.example/story')] })]),
       node('financials', [fact({ section: 'financials', group_key: 'k', sources: [src('https://brand-new.example/x')] })]),
     ],
     known
@@ -143,7 +143,7 @@ test('merge: known_urls drops a merged fact even when only one of its URLs is kn
 });
 
 test('merge: an empty or failed topic node contributes nothing and does not throw', () => {
-  const { facts } = mergeTopicFacts([node('news', []), null, undefined, node('financials', [fact()])]);
+  const { facts } = mergeTopicFacts([node('growth_signals', []), null, undefined, node('financials', [fact()])]);
   assert.equal(facts.length, 1);
 });
 
@@ -203,7 +203,7 @@ test('merge: a shared group_key still merges when both sides\' stats agree', () 
 test('merge: facts with stats:null are unaffected by the market guard (company behavior unchanged)', () => {
   const { facts, mergedCount } = mergeTopicFacts([
     node('financials', [fact({ section: 'financials', group_key: 'acme-series-c', sources: [src('https://tc.example/a')] })]),
-    node('news', [fact({ section: 'news', group_key: 'acme-series-c', sources: [src('https://wsj.example/b')] })]),
+    node('growth_signals', [fact({ section: 'growth_signals', group_key: 'acme-series-c', sources: [src('https://wsj.example/b')] })]),
   ]);
   assert.equal(facts.length, 1, 'null-stats facts still merge on a shared group_key');
   assert.equal(mergedCount, 1);
@@ -222,7 +222,7 @@ test('verify gate targets only risky facts', () => {
     riskyReason(fact({ text: 'Rumored to be exploring a sale.', sources: twoSources }), { now }),
     'rumor-labeled'
   );
-  // news window is 6 months: cutoff 2026-01-23, so a 2026-01-30 fact sits
+  // growth_signals window is 6 months: cutoff 2026-01-23, so a 2026-01-30 fact sits
   // inside the 14-day edge band where a small date error flips inclusion.
   assert.equal(
     riskyReason(fact({ fact_date: '2026-01-30', sources: twoSources }), { now }),

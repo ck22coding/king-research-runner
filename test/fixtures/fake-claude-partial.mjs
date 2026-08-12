@@ -11,11 +11,11 @@ if (nodeKind(promptArg()) === 'topic:financials') {
 
 respond({
   facts: (section) =>
-    section !== 'news'
+    section !== 'growth_signals'
       ? []
       : [
           {
-            section: 'news',
+            section: 'growth_signals',
             text: 'Runner Test Co partial-fixture story (financials failed this run).',
             fact_date: '2026-07-15',
             group_key: null,
